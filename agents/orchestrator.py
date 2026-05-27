@@ -54,6 +54,7 @@ class AgentOrchestrator:
             selected = self.agents.get("executive")
         logger.info(f"Routing to {selected.name}")
         selected.status = "working"
+        result = None
         try:
             result = await selected.process(task, context)
             duration_ms = (time.monotonic() - start) * 1000
@@ -73,7 +74,7 @@ class AgentOrchestrator:
             self.routing_history.append({
                 "task": task,
                 "agent": selected.name,
-                "result": result if 'result' in locals() else None,
+                "result": result,
                 "timestamp": datetime.now().isoformat(),
                 "correlation_id": correlation_id
             })
