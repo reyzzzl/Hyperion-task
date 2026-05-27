@@ -93,8 +93,8 @@ python -m hyperion_task.main
 ## 🚀 Installation & Running Tutorial
 ### 1. Clone the repository
 ```bash
-git clone [https://github.com/yourusername/hyperion_task.git](https://github.com/yourusername/hyperion_task.git)
-cd hyperion_task
+git clone [https://github.com/reyzzzl/Hyperion-task.git](https://github.com/reyzzzl/Hyperion-task.git)
+cd Hyperion-task
 
 ```
 ### 2. Run with Docker Compose (Easiest)
