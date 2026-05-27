@@ -226,14 +226,9 @@ Orchestration tasks run on systematic structured JSON templates. This setup pars
  * **Custom Action Nodes:** Append your procedural python rules into the core class handler block WorkflowExecutor.registered_actions.
  * **Third-Party Integrations:** Add separate custom scripts to the integrations/ folder, then link initialization bindings within main.py.
  * **String Parsing Engines:** The underlying parsing logic inside core/template.py handles recursive target objects ({{node.output.data}}) and list tracking indexes out of the box.
-
-# Quick Docker Maintenance Commands
-docker compose restart        # Soft restart runtime environments
-docker compose down -v        # Terminate active services and wipe structural file system cache targets
-docker compose logs -f app    # Attach to live application standard logging pipelines
-
-```
 ## 📄 License
 This platform is distributed open-source under the **MIT License**. You are free to run, fork, adjust, or utilize the system configuration setups in commercial enterprise deployments.
 ## 🤝 Contributing
 Pull requests are welcome. For significant structural refactors, please open a design issue first to outline the proposed optimizations.
+## 📞Hyperion team contact
+[Contact me](mailto:Hyperionteam@proton.me)
