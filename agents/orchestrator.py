@@ -7,11 +7,18 @@ from typing import Any, Dict, List, Optional
 
 from .base import BaseAgent, get_shared_client
 from .registry import AgentRegistry
-from .prompts import CLASSIFICATION_PROMPT
 from ..utils.logging import get_logger, get_correlation_id
 from ..utils.metrics import metrics
 from ..utils.shared_memory import SharedMemory
 from ..utils.exceptions import HyperionException
+
+try:
+    from .prompts import CLASSIFICATION_PROMPT
+except ImportError:
+    CLASSIFICATION_PROMPT = """Classify the user request into one of these agent categories: {agents}
+User request: {text}
+Respond with ONLY the agent name (one word: {keys}).
+If unsure, respond with 'executive'."""
 
 logger = get_logger("AgentOrchestrator")
 
