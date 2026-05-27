@@ -1,7 +1,8 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch, MagicMock
 from hyperion_task.agents.base import BaseAgent
 from hyperion_task.utils.exceptions import RateLimitExceeded
+from hyperion_task.utils.circuit_breaker import CircuitState, CircuitOpenError
 
 class DummyAgent(BaseAgent):
     async def process(self, task, context):
@@ -17,9 +18,9 @@ async def test_think_rate_limiting():
 @pytest.mark.asyncio
 async def test_think_circuit_breaker_open():
     agent = DummyAgent("test", "testing")
-    agent._circuit_breaker.state = "open"
-    result = await agent.think("test")
-    assert result == ""
+    with patch.object(agent._circuit_breaker, 'call', side_effect=CircuitOpenError("Open")):
+        result = await agent.think("test")
+        assert result == ""
 
 @pytest.mark.asyncio
 async def test_think_success():
