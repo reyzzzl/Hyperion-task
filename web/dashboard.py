@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from ..core.workflow_manager import WorkflowManager
+from hyperion_task.core.workflow_manager import WorkflowManager
 from .auth import API_TOKEN
 
 logger = logging.getLogger("Dashboard")
@@ -115,10 +115,12 @@ async def approve_task(
         raise HTTPException(404, "Task not found")
     if task["status"] != "waiting_approval":
         raise HTTPException(400, "Task not waiting for approval")
+
+    # Hanya proses jika approved (karena reject ditangani oleh route terpisah)
+    # Jika decision bukan yes/approve, kita anggap invalid
     approved = decision.lower() in ("yes", "approve")
     if not approved:
-        await manager.db.update_task_status(task_id, "cancelled", f"Rejected by human: {notes}")
-        return {"message": "Task rejected"}
+        raise HTTPException(400, "Invalid decision for approval endpoint. Use /reject for rejection.")
 
     task["human_decision"] = {"approved": True, "notes": notes}
     task["status"] = "pending"
