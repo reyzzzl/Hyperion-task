@@ -2,11 +2,11 @@ import asyncio
 import logging
 import os
 import uvicorn
-from database.sqlite import TaskDatabase
-from integrations.notion_erp import NotionERPConnector
-from integrations.erp import DummyERPConnector
-from web.dashboard import app, set_workflow_manager
-from core.workflow_manager import WorkflowManager
+from hyperion_task.database.sqlite import TaskDatabase
+from hyperion_task.integrations.notion_erp import NotionERPConnector
+from hyperion_task.integrations.erp import DummyERPConnector
+from hyperion_task.web.dashboard import app, set_workflow_manager
+from hyperion_task.core.workflow_manager import WorkflowManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +29,6 @@ def get_erp_connector():
 
 
 async def main():
-    company_name = os.environ.get("COMPANY_NAME", "MyCompany")
     llm_backend = os.environ.get("LLM_BACKEND", "ollama").lower()
     if llm_backend not in ("ollama", "huggingface"):
         logger.warning(f"Unknown LLM_BACKEND '{llm_backend}', defaulting to ollama")
@@ -49,7 +48,7 @@ async def main():
 
     if email_provider == "google":
         try:
-            from integrations.google_workspace import GoogleWorkspace
+            from hyperion_task.integrations.google_workspace import GoogleWorkspace
             email_integration = GoogleWorkspace()
             logger.info("GoogleWorkspace integration initialized.")
         except FileNotFoundError as e:
@@ -62,7 +61,7 @@ async def main():
         secret = os.environ.get("MS365_CLIENT_SECRET", "")
         if tenant and client_id and secret:
             try:
-                from integrations.microsoft365 import Microsoft365
+                from hyperion_task.integrations.microsoft365 import Microsoft365
                 email_integration = Microsoft365(tenant, client_id, secret)
                 logger.info("Microsoft365 integration initialized.")
             except ConnectionError as e:
