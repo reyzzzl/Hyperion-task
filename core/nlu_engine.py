@@ -40,7 +40,8 @@ class NLUEngine:
                     messages=[{"role": "user", "content": self.build_nlu_prompt(user_input)}],
                     format="json",
                 )
-                content = response["message"]["content"].strip()
+                # PERBAIKAN: gunakan atribut, bukan subscript
+                content = response.message.content.strip()
                 try:
                     parsed = json.loads(content)
                 except json.JSONDecodeError:
