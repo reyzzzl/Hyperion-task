@@ -116,8 +116,7 @@ async def approve_task(
     if task["status"] != "waiting_approval":
         raise HTTPException(400, "Task not waiting for approval")
 
-    # Hanya proses jika approved (karena reject ditangani oleh route terpisah)
-    # Jika decision bukan yes/approve, kita anggap invalid
+    # Hanya proses jika approved (reject ditangani route terpisah)
     approved = decision.lower() in ("yes", "approve")
     if not approved:
         raise HTTPException(400, "Invalid decision for approval endpoint. Use /reject for rejection.")
