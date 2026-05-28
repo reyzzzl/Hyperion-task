@@ -23,7 +23,7 @@ def get_shared_client():
     return _shared_client
 
 class BaseAgent(ABC):
-    def __init__(self, name: str, expertise: str, model: str = None, shared_memory: Dict = None):
+    def __init__(self, name: str, expertise: str, model: str = None, shared_memory: dict = None):
         self.agent_id = str(uuid.uuid4())
         self.name = name
         self.expertise = expertise
@@ -44,7 +44,7 @@ class BaseAgent(ABC):
     def has_credential(self, credential_name: str) -> bool:
         return credential_name in self._credential_scope
 
-    @retry(exceptions=(LLMTimeoutError,), max_attempts=2, delay=1.0)
+    @retry(exceptions=(LLMTimeoutError,), max_attempts=3, delay=1.0)
     async def think(self, prompt: str, timeout: int = 30) -> str:
         start = time.monotonic()
         async def _call():
