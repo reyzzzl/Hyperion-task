@@ -5,10 +5,12 @@ import os
 import base64
 import gzip
 import copy
+import re
+import concurrent.futures
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 from dataclasses import dataclass, field
 import uuid
 import httpx
@@ -99,6 +101,27 @@ class ActionType(Enum):
     THROW_ERROR = "throw_error"
 
 
+class WorkflowResult(TypedDict):
+    status: str
+    errors: List[str]
+    workflow_id: str
+    completed_at: str
+    started_at: str
+    node_outputs: Dict[str, Any]
+    output: Dict[str, Any]
+    execution_id: str
+    input: Dict[str, Any]
+    depth: int
+
+
+class WorkflowAPIResponse(TypedDict):
+    success: bool
+    status: str
+    errors: List[str]
+    workflow_id: str
+    data: Optional[WorkflowResult]
+
+
 @dataclass
 class WorkflowNode:
     node_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -109,6 +132,12 @@ class WorkflowNode:
     retry_count: int = 3
     timeout_seconds: int = 30
     temp_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.retry_count < 0 or self.retry_count > 10:
+            raise ValueError(f"retry_count must be 0-10, got {self.retry_count}")
+        if self.timeout_seconds < 1 or self.timeout_seconds > 300:
+            raise ValueError(f"timeout_seconds must be 1-300, got {self.timeout_seconds}")
 
 
 @dataclass
@@ -123,6 +152,10 @@ class Workflow:
     status: WorkflowStatus = WorkflowStatus.PENDING
     max_iterations: int = 100
 
+    def __post_init__(self):
+        if self.max_iterations < 1 or self.max_iterations > 10000:
+            raise ValueError(f"max_iterations must be 1-10000, got {self.max_iterations}")
+
 
 def _is_path_inside(base: Path, target: Path) -> bool:
     try:
@@ -133,17 +166,40 @@ def _is_path_inside(base: Path, target: Path) -> bool:
         return target_str == base_str or target_str.startswith(base_str + os.sep)
 
 
+def _has_dotdot(p: Path) -> bool:
+    return ".." in p.parts
+
+
+def _deep_copy_context(ctx: Dict) -> Dict:
+    return {
+        **ctx,
+        "node_outputs": dict(ctx.get("node_outputs", {})),
+        "errors": list(ctx.get("errors", [])),
+        "output": dict(ctx.get("output", {})),
+    }
+
+
 class WorkflowExecutor:
+    SENSITIVE_EXACT = {"token", "api_key", "password", "secret", "auth_token", "access_token", "refresh_token", "bearer", "authorization"}
+    SENSITIVE_SUFFIXES = {"_token", "_key", "_password", "_secret", "_auth", "_bearer", "_authorization"}
+
     def __init__(self, db, integrations: Dict[str, Any], max_concurrent: int = 10):
         self.db = db
         self.integrations = integrations
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.active_executions: Dict[str, asyncio.Task] = {}
+        self._active_lock = asyncio.Lock()
         self._metrics_lock = asyncio.Lock()
-        self._metrics = {"executed": 0, "succeeded": 0, "failed": 0}
-        self.http_client = httpx.AsyncClient()
+        self._metrics = {"executed": 0, "succeeded": 0, "failed": 0, "cancelled": 0}
+        self.http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            timeout=httpx.Timeout(60.0)
+        )
         depth_limit = os.environ.get("WORKFLOW_DEPTH_LIMIT", "5")
         self._loop_depth_limit = int(depth_limit) if depth_limit.isdigit() else 5
+
+        self._integration_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._integration_concurrency = 5
 
         self.registered_actions: Dict[str, Callable] = {
             "http_request": self._execute_http_request,
@@ -209,8 +265,41 @@ class WorkflowExecutor:
             "throw_error": self._execute_throw_error,
         }
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
     async def close(self):
         await self.http_client.aclose()
+
+    async def cancel_workflow(self, execution_id: str) -> bool:
+        async with self._active_lock:
+            task = self.active_executions.get(execution_id)
+            if task and not task.done():
+                task.cancel()
+                return True
+            return False
+
+    async def health_check(self) -> Dict[str, Any]:
+        status = "healthy"
+        details = {}
+        if self.db is None:
+            status = "unhealthy"
+            details["db"] = "Database connection not available"
+        else:
+            try:
+                if hasattr(self.db, 'execute'):
+                    await self.db.execute("SELECT 1")
+                    details["db"] = "ok"
+                else:
+                    details["db"] = "unknown"
+            except Exception as e:
+                status = "degraded"
+                details["db"] = str(e)
+        details["http_client"] = "ok" if not self.http_client.is_closed else "closed"
+        return {"status": status, "details": details}
 
     async def _inc_metric(self, name: str, delta: int = 1):
         async with self._metrics_lock:
@@ -220,11 +309,22 @@ class WorkflowExecutor:
         async with self._metrics_lock:
             return self._metrics.copy()
 
+    def _get_integration_semaphore(self, name: str) -> asyncio.Semaphore:
+        if name not in self._integration_semaphores:
+            self._integration_semaphores[name] = asyncio.Semaphore(self._integration_concurrency)
+        return self._integration_semaphores[name]
+
     async def _load_workflow_from_db(self, workflow_id: str) -> Optional[Workflow]:
         data = await self.db.get_workflow(workflow_id)
         if not data:
             return None
         try:
+            status_str = data.get("status", "pending")
+            try:
+                status = WorkflowStatus(status_str)
+            except ValueError:
+                status = WorkflowStatus.PENDING
+
             workflow = Workflow(
                 workflow_id=data["workflow_id"],
                 name=data["name"],
@@ -232,21 +332,23 @@ class WorkflowExecutor:
                 trigger=TriggerType(data.get("trigger", "manual")),
                 trigger_config=data.get("trigger_config", {}),
                 start_node=data.get("start_node"),
+                status=status,
             )
             nodes_list = data.get("nodes", [])
             if not isinstance(nodes_list, list):
-                logger.error(f"Invalid nodes format for workflow {workflow_id}")
+                logger.error("Invalid nodes format for workflow %s", workflow_id)
                 return None
             for n_data in nodes_list:
                 try:
                     action_type = ActionType(n_data["action_type"])
                 except ValueError:
-                    logger.error(f"Invalid action_type in workflow {workflow_id}: {n_data.get('action_type')}")
+                    logger.error("Invalid action_type in workflow %s: %s", workflow_id, n_data.get('action_type'))
                     continue
+                config = n_data.get("config", {})
                 node_obj = WorkflowNode(
                     node_id=n_data.get("node_id", str(uuid.uuid4())),
                     action_type=action_type,
-                    config=n_data.get("config", {}),
+                    config=config,
                     next_node=n_data.get("next_node"),
                     on_error=n_data.get("on_error"),
                     retry_count=n_data.get("retry_count", 3),
@@ -256,19 +358,38 @@ class WorkflowExecutor:
                 workflow.nodes[node_obj.node_id] = node_obj
             return workflow
         except Exception as e:
-            logger.error(f"Failed to load workflow {workflow_id}: {e}")
+            logger.error("Failed to load workflow %s: %s", workflow_id, e)
             return None
 
-    async def execute_workflow(self, workflow: Workflow, input_data: Dict, depth: int = 0) -> Dict:
+    async def _save_execution(self, context: Dict):
+        if hasattr(self.db, 'save_execution'):
+            try:
+                await self.db.save_execution(context)
+            except Exception as e:
+                logger.error("Failed to save execution %s: %s", context.get("execution_id", "unknown"), e, exc_info=True)
+
+    async def execute_workflow(self, workflow: Workflow, input_data: Dict, depth: int = 0) -> WorkflowResult:
         if depth > self._loop_depth_limit:
-            logger.warning(f"Workflow recursion depth {depth} exceeded limit {self._loop_depth_limit}")
-            return {
+            logger.warning("Workflow recursion depth %d exceeded limit %d", depth, self._loop_depth_limit)
+            result = {
                 "status": "failed",
                 "errors": [f"Workflow recursion depth exceeded limit {self._loop_depth_limit}"],
-                "workflow_id": workflow.workflow_id
+                "workflow_id": workflow.workflow_id,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "node_outputs": {},
+                "output": {},
+                "execution_id": str(uuid.uuid4()),
+                "input": input_data,
+                "depth": depth,
             }
+            await self._save_execution(result)
+            return result
+
         execution_id = str(uuid.uuid4())
-        self.active_executions[execution_id] = asyncio.current_task()
+        async with self._active_lock:
+            self.active_executions[execution_id] = asyncio.current_task()
+
         context = {
             "execution_id": execution_id,
             "workflow_id": workflow.workflow_id,
@@ -276,8 +397,8 @@ class WorkflowExecutor:
             "output": {},
             "node_outputs": {},
             "errors": [],
-            "started_at": datetime.now().isoformat(),
-            "_depth": depth,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "depth": depth,
         }
         await self._inc_metric("executed")
         try:
@@ -286,7 +407,7 @@ class WorkflowExecutor:
                 if not current_node_id:
                     context["errors"].append("Workflow has no start_node")
                     raise ValueError("No start node")
-                max_iterations = getattr(workflow, 'max_iterations', 100)
+                max_iterations = workflow.max_iterations
                 iteration = 0
                 while current_node_id and iteration < max_iterations:
                     iteration += 1
@@ -294,7 +415,7 @@ class WorkflowExecutor:
                     if not node:
                         context["errors"].append(f"Node {current_node_id} not found")
                         break
-                    logger.debug(f"[{execution_id}] Executing node {node.node_id} ({node.action_type.value})")
+                    logger.debug("[%s] Executing node %s (%s)", execution_id, node.node_id, node.action_type.value)
                     node_result = None
                     action_func = self.registered_actions.get(node.action_type.value)
                     if not action_func:
@@ -304,6 +425,38 @@ class WorkflowExecutor:
 
                     success = False
                     no_retry_actions = {"throw_error", "stop"}
+
+                    if node.action_type.value in no_retry_actions:
+                        try:
+                            node_result = await asyncio.wait_for(
+                                action_func(node, context),
+                                timeout=node.timeout_seconds
+                            )
+                            if node_result.get("success"):
+                                self._store_node_output(context, node, node_result.get("data"))
+                                if node.action_type.value == "stop":
+                                    success = True
+                                    current_node_id = None
+                                    break
+                                else:
+                                    current_node_id = node.next_node
+                                success = True
+                            else:
+                                context["errors"].append(node_result.get("error", "Node execution failed"))
+                                if node.action_type.value == "throw_error":
+                                    context["status"] = "failed"
+                                    break
+                                else:
+                                    current_node_id = node.on_error
+                        except asyncio.TimeoutError:
+                            context["errors"].append(f"Node {current_node_id} timed out after {node.timeout_seconds}s")
+                            current_node_id = node.on_error
+                        except Exception as e:
+                            context["errors"].append(f"Node {current_node_id} error: {str(e)}")
+                            current_node_id = node.on_error
+                        if not success:
+                            continue
+
                     for attempt in range(node.retry_count + 1):
                         try:
                             node_result = await asyncio.wait_for(
@@ -313,31 +466,26 @@ class WorkflowExecutor:
                             if node_result.get("success"):
                                 self._store_node_output(context, node, node_result.get("data"))
                                 if node.action_type.value == "condition":
-                                    decision = node_result.get("data")
+                                    decision = node_result.get("data", {})
                                     if isinstance(decision, dict):
-                                        current_node_id = decision.get("next_node", node.next_node)
-                                    elif decision:
-                                        current_node_id = node.config.get("true_node", node.next_node)
+                                        condition_met = decision.get("condition_met", False)
                                     else:
-                                        current_node_id = node.config.get("false_node", node.next_node)
-                                elif node.action_type.value == "stop":
-                                    success = True
-                                    current_node_id = None
-                                    break
+                                        condition_met = bool(decision)
+                                    current_node_id = node.config.get(
+                                        "true_node" if condition_met else "false_node",
+                                        node.next_node
+                                    )
                                 else:
                                     current_node_id = node.next_node
                                 success = True
                                 break
                             else:
-                                if node.action_type.value in no_retry_actions:
-                                    break
                                 if attempt < node.retry_count:
-                                    logger.warning(f"[{execution_id}] Retrying node {node.node_id} ({attempt+1}/{node.retry_count}) after failure: {node_result.get('error')}")
+                                    logger.warning("[%s] Retrying node %s (%d/%d) after failure: %s",
+                                                   execution_id, node.node_id, attempt+1, node.retry_count, node_result.get('error'))
                                     await asyncio.sleep(2)
                         except asyncio.TimeoutError:
-                            logger.error(f"[{execution_id}] Node {current_node_id} timed out after {node.timeout_seconds}s (attempt {attempt+1})")
-                            if node.action_type.value in no_retry_actions:
-                                break
+                            logger.error("[%s] Node %s timed out after %ds (attempt %d)", execution_id, current_node_id, node.timeout_seconds, attempt+1)
                             if attempt < node.retry_count:
                                 await asyncio.sleep(2)
                                 continue
@@ -346,9 +494,7 @@ class WorkflowExecutor:
                                 current_node_id = node.on_error
                                 break
                         except Exception as e:
-                            logger.error(f"[{execution_id}] Node {current_node_id} unexpected error: {str(e)} (attempt {attempt+1})")
-                            if node.action_type.value in no_retry_actions:
-                                break
+                            logger.error("[%s] Node %s unexpected error: %s (attempt %d)", execution_id, current_node_id, str(e), attempt+1)
                             if attempt < node.retry_count:
                                 await asyncio.sleep(2)
                                 continue
@@ -362,99 +508,141 @@ class WorkflowExecutor:
                         current_node_id = node.on_error
                 if iteration >= max_iterations:
                     context["errors"].append("Max iterations reached, possible infinite loop")
-            context["completed_at"] = datetime.now().isoformat()
+            context["completed_at"] = datetime.now(timezone.utc).isoformat()
             if not context["errors"]:
                 await self._inc_metric("succeeded")
                 context["status"] = "completed"
             else:
                 await self._inc_metric("failed")
                 context["status"] = "failed"
+        except asyncio.CancelledError:
+            logger.info("[%s] Workflow cancelled", execution_id)
+            await self._inc_metric("cancelled")
+            context["status"] = "cancelled"
+            context["errors"].append("Workflow cancelled by user")
+            context["completed_at"] = datetime.now(timezone.utc).isoformat()
+            raise
         except Exception as e:
-            logger.error(f"[{execution_id}] Workflow execution error: {e}")
+            logger.error("[%s] Workflow execution error: %s", execution_id, e)
             await self._inc_metric("failed")
             context["status"] = "failed"
             context["errors"].append(str(e))
+            context["completed_at"] = datetime.now(timezone.utc).isoformat()
         finally:
-            self.active_executions.pop(execution_id, None)
+            async with self._active_lock:
+                self.active_executions.pop(execution_id, None)
+            await self._save_execution(context)
         return context
 
-    async def execute_workflow_by_id(self, workflow_id: str, input_data: Dict) -> Dict:
+    async def execute_workflow_by_id(self, workflow_id: str, input_data: Dict) -> WorkflowAPIResponse:
         workflow = await self._load_workflow_from_db(workflow_id)
         if not workflow:
-            return {"success": False, "error": f"Workflow {workflow_id} not found"}
+            return {
+                "success": False,
+                "status": "failed",
+                "errors": [f"Workflow {workflow_id} not found"],
+                "workflow_id": workflow_id,
+                "data": None
+            }
         result = await self.execute_workflow(workflow, input_data)
         return {
             "success": result.get("status") == "completed",
-            "status": result.get("status"),
+            "status": result.get("status", "unknown"),
             "errors": result.get("errors", []),
-            "workflow_id": result.get("workflow_id"),
+            "workflow_id": result.get("workflow_id", workflow_id),
             "data": result
         }
 
     def _store_node_output(self, context: Dict, node: WorkflowNode, data: Any):
-        context["node_outputs"][node.node_id] = data
+        redacted = self._redact_sensitive(data)
+        context["node_outputs"][node.node_id] = redacted
         if node.temp_id:
-            context["node_outputs"][node.temp_id] = data
+            context["node_outputs"][node.temp_id] = redacted
+
+    def _redact_sensitive(self, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {
+                k: "***REDACTED***" if (
+                    k.lower() in self.SENSITIVE_EXACT or
+                    any(k.lower().endswith(suffix) for suffix in self.SENSITIVE_SUFFIXES)
+                ) else self._redact_sensitive(v)
+                for k, v in obj.items()
+            }
+        elif isinstance(obj, list):
+            return [self._redact_sensitive(item) for item in obj]
+        else:
+            return obj
 
     def _evaluate_expression(self, expr: str, context: Dict) -> Any:
         try:
             return template_engine.render(expr, context)
         except Exception as e:
-            logger.error(f"Expression evaluation failed: {expr}, error: {e}")
+            logger.error("Expression evaluation failed: %s, error: %s", expr, e)
             return None
 
     async def _execute_http_request(self, node: WorkflowNode, context: Dict) -> Dict:
-        config = node.config
-        method = config.get("method", "GET").upper()
-        url = template_engine.render(config.get("url", ""), context)
-        headers_raw = config.get("headers", {})
-        headers = {k: template_engine.render(v, context) for k, v in headers_raw.items()}
-        body_raw = config.get("body", {})
-        try:
-            if isinstance(body_raw, str):
-                rendered_body = template_engine.render(body_raw, context)
-                try:
-                    body = json.loads(rendered_body)
-                except json.JSONDecodeError:
-                    body = rendered_body
-            else:
-                rendered_json = json.dumps(body_raw)
-                rendered = template_engine.render(rendered_json, context)
-                try:
-                    body = json.loads(rendered)
-                except json.JSONDecodeError:
-                    body = rendered
-        except Exception as e:
-            return {"success": False, "error": f"Body rendering failed: {e}"}
-        try:
-            if method == "GET":
-                resp = await self.http_client.get(url, headers=headers, timeout=node.timeout_seconds)
-            elif method == "POST":
-                if isinstance(body, (dict, list)):
-                    resp = await self.http_client.post(url, headers=headers, json=body, timeout=node.timeout_seconds)
-                else:
-                    resp = await self.http_client.post(url, headers=headers, content=body, timeout=node.timeout_seconds)
-            elif method == "PUT":
-                if isinstance(body, (dict, list)):
-                    resp = await self.http_client.put(url, headers=headers, json=body, timeout=node.timeout_seconds)
-                else:
-                    resp = await self.http_client.put(url, headers=headers, content=body, timeout=node.timeout_seconds)
-            elif method == "DELETE":
-                resp = await self.http_client.delete(url, headers=headers, timeout=node.timeout_seconds)
-            else:
-                return {"success": False, "error": f"Unsupported method {method}"}
-            if 200 <= resp.status_code <= 299:
-                if resp.content:
+        sem = self._get_integration_semaphore("http")
+        async with sem:
+            config = node.config
+            method = config.get("method", "GET").upper()
+            url = template_engine.render(config.get("url", ""), context)
+            headers_raw = config.get("headers", {})
+            headers = {}
+            for k, v in headers_raw.items():
+                rendered = template_engine.render(v, context)
+                rendered = re.sub(r'[\r\n]', '', rendered)
+                headers[k] = rendered
+            body_raw = config.get("body", {})
+            max_payload = 10 * 1024 * 1024
+            try:
+                if isinstance(body_raw, str):
+                    rendered_body = template_engine.render(body_raw, context)
+                    if len(rendered_body) > max_payload:
+                        return {"success": False, "error": f"Payload too large: {len(rendered_body)} bytes"}
                     try:
-                        data = resp.json()
+                        body = json.loads(rendered_body)
                     except json.JSONDecodeError:
-                        data = resp.text
+                        body = rendered_body
                 else:
-                    data = {}
-                return {"success": True, "data": data}
-            return {"success": False, "error": f"HTTP {resp.status_code}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+                    rendered_json = json.dumps(body_raw)
+                    rendered = template_engine.render(rendered_json, context)
+                    if len(rendered) > max_payload:
+                        return {"success": False, "error": f"Payload too large: {len(rendered)} bytes"}
+                    try:
+                        body = json.loads(rendered)
+                    except json.JSONDecodeError:
+                        body = rendered
+            except Exception as e:
+                return {"success": False, "error": f"Body rendering failed: {e}"}
+            try:
+                if method == "GET":
+                    resp = await self.http_client.get(url, headers=headers, timeout=node.timeout_seconds)
+                elif method == "POST":
+                    if isinstance(body, (dict, list)):
+                        resp = await self.http_client.post(url, headers=headers, json=body, timeout=node.timeout_seconds)
+                    else:
+                        resp = await self.http_client.post(url, headers=headers, content=body, timeout=node.timeout_seconds)
+                elif method == "PUT":
+                    if isinstance(body, (dict, list)):
+                        resp = await self.http_client.put(url, headers=headers, json=body, timeout=node.timeout_seconds)
+                    else:
+                        resp = await self.http_client.put(url, headers=headers, content=body, timeout=node.timeout_seconds)
+                elif method == "DELETE":
+                    resp = await self.http_client.delete(url, headers=headers, timeout=node.timeout_seconds)
+                else:
+                    return {"success": False, "error": f"Unsupported method {method}"}
+                if 200 <= resp.status_code <= 299:
+                    if resp.content:
+                        try:
+                            data = resp.json()
+                        except json.JSONDecodeError:
+                            data = resp.text
+                    else:
+                        data = {}
+                    return {"success": True, "data": data}
+                return {"success": False, "error": f"HTTP {resp.status_code}"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_database_query(self, node: WorkflowNode, context: Dict) -> Dict:
         config = node.config
@@ -465,31 +653,41 @@ class WorkflowExecutor:
         params_raw = config.get("params", {})
         params = {k: template_engine.render(str(v), context) for k, v in params_raw.items()}
         try:
-            if not hasattr(self.db, 'db') or self.db.db is None:
+            if self.db is None or not hasattr(self.db, 'execute'):
                 return {"success": False, "error": "Database connection not available"}
-            cursor = await self.db.db.execute(query, params)
-            try:
-                rows = await cursor.fetchall()
-                return {"success": True, "data": [dict(row) for row in rows]}
-            finally:
-                await cursor.close()
+            cursor = await self.db.execute(query, params)
+            rows = await cursor.fetchall()
+            cursor.close()
+            data = []
+            for row in rows:
+                if hasattr(row, '_mapping'):
+                    data.append(dict(row._mapping))
+                elif hasattr(row, '_asdict'):
+                    data.append(row._asdict())
+                elif hasattr(row, '__iter__') and hasattr(row, 'keys'):
+                    data.append(dict(row))
+                else:
+                    data.append({"value": str(row)})
+            return {"success": True, "data": data}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def _execute_send_email(self, node: WorkflowNode, context: Dict) -> Dict:
-        config = node.config
-        to = template_engine.render(config.get("to", ""), context)
-        subject = template_engine.render(config.get("subject", ""), context)
-        body = template_engine.render(config.get("body", ""), context)
-        email_service = self.integrations.get("email")
-        if email_service:
-            result = await email_service.send_email(to, subject, body)
-            if isinstance(result, dict):
-                if result.get("success"):
-                    return {"success": True, "data": result}
-                return {"success": False, "error": result.get("error", "Unknown email error")}
-            return {"success": False, "error": f"Unexpected response type: {type(result)}"}
-        return {"success": False, "error": "No email integration configured"}
+        sem = self._get_integration_semaphore("email")
+        async with sem:
+            config = node.config
+            to = template_engine.render(config.get("to", ""), context)
+            subject = template_engine.render(config.get("subject", ""), context)
+            body = template_engine.render(config.get("body", ""), context)
+            email_service = self.integrations.get("email")
+            if email_service:
+                result = await email_service.send_email(to, subject, body)
+                if isinstance(result, dict):
+                    if result.get("success"):
+                        return {"success": True, "data": result}
+                    return {"success": False, "error": result.get("error", "Unknown email error")}
+                return {"success": False, "error": f"Unexpected response type: {type(result)}"}
+            return {"success": False, "error": "No email integration configured"}
 
     async def _execute_transform_data(self, node: WorkflowNode, context: Dict) -> Dict:
         config = node.config
@@ -515,8 +713,6 @@ class WorkflowExecutor:
         field_expr = config.get("field")
         operator = config.get("operator", "equals")
         value = config.get("value")
-        true_node = config.get("true_node")
-        false_node = config.get("false_node")
         if not field_expr:
             return {"success": False, "error": "Condition missing 'field'"}
         current_value = self._evaluate_expression(field_expr, context)
@@ -539,10 +735,9 @@ class WorkflowExecutor:
             else:
                 return {"success": False, "error": f"Unknown operator: {operator}"}
         except (ValueError, TypeError) as e:
-            logger.error(f"Condition evaluation error: {e}")
+            logger.error("Condition evaluation error: %s", e)
             condition_met = False
-        next_node = true_node if condition_met else false_node
-        return {"success": True, "data": {"condition_met": condition_met, "next_node": next_node}}
+        return {"success": True, "data": {"condition_met": condition_met}}
 
     async def _execute_loop(self, node: WorkflowNode, context: Dict) -> Dict:
         config = node.config
@@ -572,19 +767,22 @@ class WorkflowExecutor:
         results = []
         max_loop_iterations = node.config.get("max_iterations", 100)
         sub_workflow.max_iterations = node.config.get("sub_workflow_max_iterations", 10)
-        current_depth = context.get("_depth", 0)
+        current_depth = context.get("depth", 0)
         new_depth = current_depth + 1
         if new_depth > self._loop_depth_limit:
             return {"success": False, "error": f"Loop depth exceeded limit {self._loop_depth_limit}"}
         for idx, item in enumerate(items):
             if idx >= max_loop_iterations:
                 break
-            sub_context = {**context, "loop_item": item, "loop_index": idx}
+            sub_context = _deep_copy_context(context)
+            sub_context["loop_item"] = item
+            sub_context["loop_index"] = idx
+            sub_context["depth"] = new_depth
             try:
                 result = await self.execute_workflow(sub_workflow, sub_context, depth=new_depth)
                 results.append(result)
             except Exception as e:
-                logger.error(f"Loop iteration {idx} failed: {e}")
+                logger.error("Loop iteration %d failed: %s", idx, e)
                 results.append({"error": str(e), "status": "failed"})
         return {"success": True, "data": results}
 
@@ -594,88 +792,102 @@ class WorkflowExecutor:
         return {"success": True, "data": f"Delayed for {seconds}s"}
 
     async def _execute_google_sheets_read(self, node: WorkflowNode, context: Dict) -> Dict:
-        gs = self.integrations.get("google")
-        if not gs:
-            return {"success": False, "error": "Google integration not configured"}
-        spreadsheet_id = template_engine.render(node.config.get("spreadsheet_id", ""), context)
-        range_name = template_engine.render(node.config.get("range", "Sheet1!A1:Z"), context)
-        result = await gs.sheets_operation(spreadsheet_id, range_name, operation="read")
-        if isinstance(result, dict) and "values" in result:
-            return {"success": True, "data": result["values"]}
-        return {"success": False, "error": result.get("error", "Read failed") if isinstance(result, dict) else "Invalid response"}
+        sem = self._get_integration_semaphore("google")
+        async with sem:
+            gs = self.integrations.get("google")
+            if not gs:
+                return {"success": False, "error": "Google integration not configured"}
+            spreadsheet_id = template_engine.render(node.config.get("spreadsheet_id", ""), context)
+            range_name = template_engine.render(node.config.get("range", "Sheet1!A1:Z"), context)
+            result = await gs.sheets_operation(spreadsheet_id, range_name, operation="read")
+            if isinstance(result, dict) and "values" in result:
+                return {"success": True, "data": result["values"]}
+            return {"success": False, "error": result.get("error", "Read failed") if isinstance(result, dict) else "Invalid response"}
 
     async def _execute_google_sheets_write(self, node: WorkflowNode, context: Dict) -> Dict:
-        gs = self.integrations.get("google")
-        if not gs:
-            return {"success": False, "error": "Google integration not configured"}
-        spreadsheet_id = template_engine.render(node.config.get("spreadsheet_id", ""), context)
-        range_name = template_engine.render(node.config.get("range", "Sheet1!A1"), context)
-        values = node.config.get("values", [])
-        rendered_values = []
-        for row in values:
-            new_row = []
-            for cell in row:
-                if isinstance(cell, str) and "{{" in cell:
-                    cell = template_engine.render(cell, context)
-                new_row.append(cell)
-            rendered_values.append(new_row)
-        result = await gs.sheets_operation(spreadsheet_id, range_name, values=rendered_values, operation="write")
-        if isinstance(result, dict) and result.get("success"):
-            return {"success": True, "data": result}
-        return {"success": False, "error": result.get("error", "Write failed") if isinstance(result, dict) else "Invalid response"}
+        sem = self._get_integration_semaphore("google")
+        async with sem:
+            gs = self.integrations.get("google")
+            if not gs:
+                return {"success": False, "error": "Google integration not configured"}
+            spreadsheet_id = template_engine.render(node.config.get("spreadsheet_id", ""), context)
+            range_name = template_engine.render(node.config.get("range", "Sheet1!A1"), context)
+            values = node.config.get("values", [])
+            rendered_values = []
+            for row in values:
+                new_row = []
+                for cell in row:
+                    if isinstance(cell, str) and "{{" in cell:
+                        cell = template_engine.render(cell, context)
+                    new_row.append(cell)
+                rendered_values.append(new_row)
+            result = await gs.sheets_operation(spreadsheet_id, range_name, values=rendered_values, operation="write")
+            if isinstance(result, dict) and result.get("success"):
+                return {"success": True, "data": result}
+            return {"success": False, "error": result.get("error", "Write failed") if isinstance(result, dict) else "Invalid response"}
 
     async def _execute_google_drive_upload(self, node: WorkflowNode, context: Dict) -> Dict:
-        gs = self.integrations.get("google")
-        if not gs:
-            return {"success": False, "error": "Google integration not configured"}
-        if hasattr(gs, "drive_upload"):
-            file_path = template_engine.render(node.config.get("file_path", ""), context)
-            mime_type = node.config.get("mime_type", "application/octet-stream")
-            result = await gs.drive_upload(file_path, mime_type)
-            return result
-        return {"success": False, "error": "Drive upload not implemented in integration"}
+        sem = self._get_integration_semaphore("google")
+        async with sem:
+            gs = self.integrations.get("google")
+            if not gs:
+                return {"success": False, "error": "Google integration not configured"}
+            if hasattr(gs, "drive_upload"):
+                file_path = template_engine.render(node.config.get("file_path", ""), context)
+                mime_type = node.config.get("mime_type", "application/octet-stream")
+                result = await gs.drive_upload(file_path, mime_type)
+                return result
+            return {"success": False, "error": "Drive upload not implemented in integration"}
 
     async def _execute_google_docs_create(self, node: WorkflowNode, context: Dict) -> Dict:
-        gs = self.integrations.get("google")
-        if not gs:
-            return {"success": False, "error": "Google integration not configured"}
-        title = template_engine.render(node.config.get("title", "New Doc"), context)
-        content = template_engine.render(node.config.get("content", ""), context)
-        result = await gs.create_doc(title, content)
-        return result
+        sem = self._get_integration_semaphore("google")
+        async with sem:
+            gs = self.integrations.get("google")
+            if not gs:
+                return {"success": False, "error": "Google integration not configured"}
+            title = template_engine.render(node.config.get("title", "New Doc"), context)
+            content = template_engine.render(node.config.get("content", ""), context)
+            result = await gs.create_doc(title, content)
+            return result
 
     async def _execute_google_calendar_event(self, node: WorkflowNode, context: Dict) -> Dict:
-        gs = self.integrations.get("google")
-        if not gs:
-            return {"success": False, "error": "Google integration not configured"}
-        summary = template_engine.render(node.config.get("summary", ""), context)
-        start_time = template_engine.render(node.config.get("start_time", ""), context)
-        end_time = template_engine.render(node.config.get("end_time", ""), context)
-        attendees = node.config.get("attendees", [])
-        timezone = node.config.get("timezone", os.environ.get("TIMEZONE", "UTC"))
-        result = await gs.schedule_meeting(summary, start_time, end_time, attendees, timezone)
-        return result
+        sem = self._get_integration_semaphore("google")
+        async with sem:
+            gs = self.integrations.get("google")
+            if not gs:
+                return {"success": False, "error": "Google integration not configured"}
+            summary = template_engine.render(node.config.get("summary", ""), context)
+            start_time = template_engine.render(node.config.get("start_time", ""), context)
+            end_time = template_engine.render(node.config.get("end_time", ""), context)
+            attendees = node.config.get("attendees", [])
+            timezone = os.environ.get("TIMEZONE", "UTC")
+            result = await gs.schedule_meeting(summary, start_time, end_time, attendees, timezone)
+            return result
 
     async def _execute_ms365_send_email(self, node: WorkflowNode, context: Dict) -> Dict:
-        ms = self.integrations.get("microsoft")
-        if not ms:
-            return {"success": False, "error": "Microsoft 365 integration not configured"}
-        to = template_engine.render(node.config.get("to", ""), context)
-        subject = template_engine.render(node.config.get("subject", ""), context)
-        body = template_engine.render(node.config.get("body", ""), context)
-        result = await ms.send_email(to, subject, body)
-        return result
+        sem = self._get_integration_semaphore("microsoft")
+        async with sem:
+            ms = self.integrations.get("microsoft")
+            if not ms:
+                return {"success": False, "error": "Microsoft 365 integration not configured"}
+            to = template_engine.render(node.config.get("to", ""), context)
+            subject = template_engine.render(node.config.get("subject", ""), context)
+            body = template_engine.render(node.config.get("body", ""), context)
+            result = await ms.send_email(to, subject, body)
+            return result
 
     async def _execute_ms365_teams_meeting(self, node: WorkflowNode, context: Dict) -> Dict:
-        ms = self.integrations.get("microsoft")
-        if not ms:
-            return {"success": False, "error": "Microsoft 365 integration not configured"}
-        subject = template_engine.render(node.config.get("subject", ""), context)
-        start_time = template_engine.render(node.config.get("start_time", ""), context)
-        end_time = template_engine.render(node.config.get("end_time", ""), context)
-        attendees = node.config.get("attendees", [])
-        result = await ms.create_teams_meeting(subject, start_time, end_time, attendees)
-        return result
+        sem = self._get_integration_semaphore("microsoft")
+        async with sem:
+            ms = self.integrations.get("microsoft")
+            if not ms:
+                return {"success": False, "error": "Microsoft 365 integration not configured"}
+            subject = template_engine.render(node.config.get("subject", ""), context)
+            start_time = template_engine.render(node.config.get("start_time", ""), context)
+            end_time = template_engine.render(node.config.get("end_time", ""), context)
+            attendees = node.config.get("attendees", [])
+            result = await ms.create_teams_meeting(subject, start_time, end_time, attendees)
+            return result
 
     async def _execute_ms365_onedrive_upload(self, node: WorkflowNode, context: Dict) -> Dict:
         return {"success": False, "error": "OneDrive upload not implemented yet"}
@@ -684,73 +896,81 @@ class WorkflowExecutor:
         return {"success": False, "error": "Excel write not implemented yet"}
 
     async def _execute_slack_send_message(self, node: WorkflowNode, context: Dict) -> Dict:
-        webhook_url = node.config.get("webhook_url")
-        if not webhook_url:
-            return {"success": False, "error": "Slack webhook URL required"}
-        webhook_url = template_engine.render(webhook_url, context)
-        text = template_engine.render(node.config.get("text", ""), context)
-        try:
-            resp = await self.http_client.post(webhook_url, json={"text": text})
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except json.JSONDecodeError:
-                    data = resp.text
-                return {"success": True, "data": data}
-            return {"success": False, "error": f"Slack error: {resp.status_code} - {resp.text}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        sem = self._get_integration_semaphore("slack")
+        async with sem:
+            webhook_url = node.config.get("webhook_url")
+            if not webhook_url:
+                return {"success": False, "error": "Slack webhook URL required"}
+            webhook_url = template_engine.render(webhook_url, context)
+            text = template_engine.render(node.config.get("text", ""), context)
+            try:
+                resp = await self.http_client.post(webhook_url, json={"text": text})
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except json.JSONDecodeError:
+                        data = resp.text
+                    return {"success": True, "data": data}
+                return {"success": False, "error": f"Slack error: {resp.status_code} - {resp.text}"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_telegram_send_message(self, node: WorkflowNode, context: Dict) -> Dict:
-        bot_token = node.config.get("bot_token")
-        chat_id = node.config.get("chat_id")
-        if not bot_token or not chat_id:
-            return {"success": False, "error": "Telegram bot_token and chat_id required"}
-        bot_token = template_engine.render(bot_token, context)
-        chat_id = template_engine.render(str(chat_id), context)
-        text = template_engine.render(node.config.get("text", ""), context)
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        try:
-            resp = await self.http_client.post(url, json={"chat_id": chat_id, "text": text})
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("ok"):
-                    return {"success": True, "data": data}
-                return {"success": False, "error": data.get("description", "Telegram error")}
-            return {"success": False, "error": f"Telegram error: {resp.text}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        sem = self._get_integration_semaphore("telegram")
+        async with sem:
+            bot_token = node.config.get("bot_token")
+            chat_id = node.config.get("chat_id")
+            if not bot_token or not chat_id:
+                return {"success": False, "error": "Telegram bot_token and chat_id required"}
+            bot_token = template_engine.render(bot_token, context)
+            chat_id = template_engine.render(str(chat_id), context)
+            text = template_engine.render(node.config.get("text", ""), context)
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            try:
+                resp = await self.http_client.post(url, json={"chat_id": chat_id, "text": text})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("ok"):
+                        return {"success": True, "data": data}
+                    return {"success": False, "error": data.get("description", "Telegram error")}
+                return {"success": False, "error": f"Telegram error: {resp.text}"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_discord_webhook(self, node: WorkflowNode, context: Dict) -> Dict:
-        webhook_url = template_engine.render(node.config.get("webhook_url", ""), context)
-        content = template_engine.render(node.config.get("content", ""), context)
-        try:
-            resp = await self.http_client.post(webhook_url, json={"content": content})
-            success = resp.status_code in (200, 204)
-            return {"success": success, "data": {"status": resp.status_code}}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        sem = self._get_integration_semaphore("discord")
+        async with sem:
+            webhook_url = template_engine.render(node.config.get("webhook_url", ""), context)
+            content = template_engine.render(node.config.get("content", ""), context)
+            try:
+                resp = await self.http_client.post(webhook_url, json={"content": content})
+                success = resp.status_code in (200, 204)
+                return {"success": success, "data": {"status": resp.status_code}}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_whatsapp_business(self, node: WorkflowNode, context: Dict) -> Dict:
         return {"success": False, "error": "WhatsApp Business not implemented yet"}
 
     async def _execute_hubspot_create_contact(self, node: WorkflowNode, context: Dict) -> Dict:
-        api_key = self.integrations.get("hubspot_api_key") or os.environ.get("HUBSPOT_API_KEY")
-        if not api_key:
-            return {"success": False, "error": "HubSpot API key not configured in environment"}
-        email = template_engine.render(node.config.get("email", ""), context)
-        firstname = template_engine.render(node.config.get("firstname", ""), context)
-        lastname = template_engine.render(node.config.get("lastname", ""), context)
-        url = "https://api.hubapi.com/crm/v3/objects/contacts"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        body = {"properties": {"email": email, "firstname": firstname, "lastname": lastname}}
-        try:
-            resp = await self.http_client.post(url, headers=headers, json=body)
-            if resp.status_code in (200, 201):
-                return {"success": True, "data": resp.json()}
-            return {"success": False, "error": f"HubSpot error: {resp.text}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        sem = self._get_integration_semaphore("hubspot")
+        async with sem:
+            api_key = self.integrations.get("hubspot_api_key") or os.environ.get("HUBSPOT_API_KEY")
+            if not api_key:
+                return {"success": False, "error": "HubSpot API key not configured in environment"}
+            email = template_engine.render(node.config.get("email", ""), context)
+            firstname = template_engine.render(node.config.get("firstname", ""), context)
+            lastname = template_engine.render(node.config.get("lastname", ""), context)
+            url = "https://api.hubapi.com/crm/v3/objects/contacts"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            body = {"properties": {"email": email, "firstname": firstname, "lastname": lastname}}
+            try:
+                resp = await self.http_client.post(url, headers=headers, json=body)
+                if resp.status_code in (200, 201):
+                    return {"success": True, "data": resp.json()}
+                return {"success": False, "error": f"HubSpot error: {resp.text}"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_hubspot_update_deal(self, node: WorkflowNode, context: Dict) -> Dict:
         return {"success": False, "error": "HubSpot update deal not implemented"}
@@ -759,48 +979,52 @@ class WorkflowExecutor:
         return {"success": False, "error": "Salesforce not implemented"}
 
     async def _execute_mailchimp_add_subscriber(self, node: WorkflowNode, context: Dict) -> Dict:
-        api_key = self.integrations.get("mailchimp_api_key") or os.environ.get("MAILCHIMP_API_KEY")
-        if not api_key:
-            return {"success": False, "error": "Mailchimp API key not configured"}
-        list_id = node.config.get("list_id")
-        email = template_engine.render(node.config.get("email", ""), context)
-        if not list_id:
-            return {"success": False, "error": "Mailchimp list_id required"}
-        dc = api_key.split('-')[-1]
-        url = f"https://{dc}.api.mailchimp.com/3.0/lists/{list_id}/members"
-        auth = httpx.BasicAuth("anystring", api_key)
-        data = {"email_address": email, "status": "subscribed"}
-        try:
-            resp = await self.http_client.post(url, json=data, auth=auth)
-            if resp.status_code in (200, 201):
-                return {"success": True, "data": resp.json()}
-            return {"success": False, "error": f"Mailchimp error: {resp.text}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        sem = self._get_integration_semaphore("mailchimp")
+        async with sem:
+            api_key = self.integrations.get("mailchimp_api_key") or os.environ.get("MAILCHIMP_API_KEY")
+            if not api_key:
+                return {"success": False, "error": "Mailchimp API key not configured"}
+            list_id = node.config.get("list_id")
+            email = template_engine.render(node.config.get("email", ""), context)
+            if not list_id:
+                return {"success": False, "error": "Mailchimp list_id required"}
+            dc = api_key.split('-')[-1]
+            url = f"https://{dc}.api.mailchimp.com/3.0/lists/{list_id}/members"
+            auth = httpx.BasicAuth("anystring", api_key)
+            data = {"email_address": email, "status": "subscribed"}
+            try:
+                resp = await self.http_client.post(url, json=data, auth=auth)
+                if resp.status_code in (200, 201):
+                    return {"success": True, "data": resp.json()}
+                return {"success": False, "error": f"Mailchimp error: {resp.text}"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_sendgrid_send_email(self, node: WorkflowNode, context: Dict) -> Dict:
-        api_key = self.integrations.get("sendgrid_api_key") or os.environ.get("SENDGRID_API_KEY")
-        if not api_key:
-            return {"success": False, "error": "SendGrid API key not configured"}
-        from_email = template_engine.render(node.config.get("from_email", ""), context)
-        to_email = template_engine.render(node.config.get("to_email", ""), context)
-        subject = template_engine.render(node.config.get("subject", ""), context)
-        content = template_engine.render(node.config.get("content", ""), context)
-        url = "https://api.sendgrid.com/v3/mail/send"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        data = {
-            "personalizations": [{"to": [{"email": to_email}]}],
-            "from": {"email": from_email},
-            "subject": subject,
-            "content": [{"type": "text/html", "value": content}]
-        }
-        try:
-            resp = await self.http_client.post(url, headers=headers, json=data)
-            if resp.status_code == 202:
-                return {"success": True, "data": {"message": "Sent"}}
-            return {"success": False, "error": f"SendGrid error: {resp.text}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        sem = self._get_integration_semaphore("sendgrid")
+        async with sem:
+            api_key = self.integrations.get("sendgrid_api_key") or os.environ.get("SENDGRID_API_KEY")
+            if not api_key:
+                return {"success": False, "error": "SendGrid API key not configured"}
+            from_email = template_engine.render(node.config.get("from_email", ""), context)
+            to_email = template_engine.render(node.config.get("to_email", ""), context)
+            subject = template_engine.render(node.config.get("subject", ""), context)
+            content = template_engine.render(node.config.get("content", ""), context)
+            url = "https://api.sendgrid.com/v3/mail/send"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            data = {
+                "personalizations": [{"to": [{"email": to_email}]}],
+                "from": {"email": from_email},
+                "subject": subject,
+                "content": [{"type": "text/html", "value": content}]
+            }
+            try:
+                resp = await self.http_client.post(url, headers=headers, json=data)
+                if resp.status_code == 202:
+                    return {"success": True, "data": {"message": "Sent"}}
+                return {"success": False, "error": f"SendGrid error: {resp.text}"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_s3_upload(self, node: WorkflowNode, context: Dict) -> Dict:
         return {"success": False, "error": "S3 upload not implemented yet"}
@@ -815,11 +1039,15 @@ class WorkflowExecutor:
         file_path = template_engine.render(node.config.get("file_path", ""), context)
         try:
             allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
+            if _has_dotdot(Path(file_path)):
+                return {"success": False, "error": "Path traversal detected"}
             requested = (allowed_dir / file_path).resolve()
             if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
             if requested == allowed_dir:
                 return {"success": False, "error": "Cannot read root data directory as file"}
+            if requested.is_symlink():
+                return {"success": False, "error": "Symlink not allowed"}
             import aiofiles
             async with aiofiles.open(requested, mode='r') as f:
                 content = await f.read()
@@ -832,6 +1060,8 @@ class WorkflowExecutor:
         content = template_engine.render(node.config.get("content", ""), context)
         try:
             allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
+            if _has_dotdot(Path(file_path)):
+                return {"success": False, "error": "Path traversal detected"}
             requested = (allowed_dir / file_path).resolve()
             if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
@@ -839,6 +1069,8 @@ class WorkflowExecutor:
                 return {"success": False, "error": "Cannot write to root data directory"}
             if not _is_path_inside(allowed_dir, requested.parent):
                 return {"success": False, "error": "Parent directory outside allowed scope"}
+            if requested.is_symlink():
+                return {"success": False, "error": "Symlink not allowed"}
             requested.parent.mkdir(parents=True, exist_ok=True)
             import aiofiles
             async with aiofiles.open(requested, mode='w') as f:
@@ -851,15 +1083,19 @@ class WorkflowExecutor:
         try:
             from reportlab.pdfgen import canvas
             file_path = template_engine.render(node.config.get("file_path", "output.pdf"), context)
-            text = template_engine.render(node.config.get("text", ""), context)
             allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
-            requested = (allowed_dir / os.path.basename(file_path)).resolve()
+            if _has_dotdot(Path(file_path)):
+                return {"success": False, "error": "Path traversal detected"}
+            requested = (allowed_dir / file_path).resolve()
             if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
             if requested == allowed_dir:
                 return {"success": False, "error": "Cannot write to root data directory"}
             if not _is_path_inside(allowed_dir, requested.parent):
                 return {"success": False, "error": "Parent directory outside allowed scope"}
+            if requested.is_symlink():
+                return {"success": False, "error": "Symlink not allowed"}
+            text = template_engine.render(node.config.get("text", ""), context)
             requested.parent.mkdir(parents=True, exist_ok=True)
             c = canvas.Canvas(str(requested))
             c.drawString(100, 750, text)
@@ -872,15 +1108,19 @@ class WorkflowExecutor:
         try:
             import openpyxl
             file_path = template_engine.render(node.config.get("file_path", "output.xlsx"), context)
-            data = node.config.get("data", [])
             allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
-            requested = (allowed_dir / os.path.basename(file_path)).resolve()
+            if _has_dotdot(Path(file_path)):
+                return {"success": False, "error": "Path traversal detected"}
+            requested = (allowed_dir / file_path).resolve()
             if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
             if requested == allowed_dir:
                 return {"success": False, "error": "Cannot write to root data directory"}
             if not _is_path_inside(allowed_dir, requested.parent):
                 return {"success": False, "error": "Parent directory outside allowed scope"}
+            if requested.is_symlink():
+                return {"success": False, "error": "Symlink not allowed"}
+            data = node.config.get("data", [])
             requested.parent.mkdir(parents=True, exist_ok=True)
             wb = openpyxl.Workbook()
             ws = wb.active
@@ -895,9 +1135,10 @@ class WorkflowExecutor:
         url = template_engine.render(node.config.get("url", ""), context)
         selector = node.config.get("selector", "body")
         max_size = 10 * 1024 * 1024
+        stream_timeout = 30.0
         try:
             from bs4 import BeautifulSoup
-            async with self.http_client.stream("GET", url) as response:
+            async with self.http_client.stream("GET", url, timeout=httpx.Timeout(stream_timeout)) as response:
                 if response.status_code != 200:
                     return {"success": False, "error": f"HTTP {response.status_code}"}
                 content_length = response.headers.get("content-length")
@@ -913,15 +1154,22 @@ class WorkflowExecutor:
                 elements = soup.select(selector)
                 texts = [el.get_text(strip=True) for el in elements]
                 return {"success": True, "data": texts}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"Stream timeout after {stream_timeout}s"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def _execute_rss_feed(self, node: WorkflowNode, context: Dict) -> Dict:
         feed_url = template_engine.render(node.config.get("feed_url", ""), context)
+        timeout = 30.0
         try:
             import feedparser
             loop = asyncio.get_running_loop()
-            parsed = await loop.run_in_executor(None, feedparser.parse, feed_url)
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                parsed = await asyncio.wait_for(
+                    loop.run_in_executor(pool, feedparser.parse, feed_url),
+                    timeout=timeout
+                )
             entries = []
             for entry in parsed.entries[:node.config.get("limit", 10)]:
                 entries.append({
@@ -931,62 +1179,86 @@ class WorkflowExecutor:
                     "summary": entry.get("summary")
                 })
             return {"success": True, "data": entries}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"RSS fetch timeout after {timeout}s"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
     async def _execute_webhook_send(self, node: WorkflowNode, context: Dict) -> Dict:
-        config = node.config
-        url = template_engine.render(config.get("url", ""), context)
-        payload = config.get("payload", {})
-        if isinstance(payload, dict):
-            rendered = {}
-            for k, v in payload.items():
-                if isinstance(v, str) and "{{" in v:
-                    rendered[k] = template_engine.render(v, context)
-                else:
-                    rendered[k] = v
-        else:
-            rendered = payload
-        try:
-            resp = await self.http_client.post(url, json=rendered, timeout=node.timeout_seconds)
-            if resp.status_code in (200, 201, 202, 204):
-                if resp.content:
+        sem = self._get_integration_semaphore("webhook")
+        async with sem:
+            config = node.config
+            url = template_engine.render(config.get("url", ""), context)
+            payload = config.get("payload", {})
+            max_payload = 10 * 1024 * 1024
+            try:
+                if isinstance(payload, dict):
+                    rendered = {}
+                    for k, v in payload.items():
+                        if isinstance(v, str) and "{{" in v:
+                            rendered[k] = template_engine.render(v, context)
+                        else:
+                            rendered[k] = v
+                    payload_str = json.dumps(rendered)
+                    if len(payload_str) > max_payload:
+                        return {"success": False, "error": f"Payload too large: {len(payload_str)} bytes"}
+                    json_payload = rendered
+                elif isinstance(payload, str):
+                    rendered = template_engine.render(payload, context)
+                    if len(rendered) > max_payload:
+                        return {"success": False, "error": f"Payload too large: {len(rendered)} bytes"}
                     try:
-                        data = resp.json()
+                        json_payload = json.loads(rendered)
                     except json.JSONDecodeError:
-                        data = resp.text
+                        json_payload = rendered
                 else:
-                    data = {}
-                return {"success": True, "data": data}
-            return {"success": False, "error": f"Webhook failed: {resp.status_code}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+                    return {"success": False, "error": "Unsupported payload type"}
+            except Exception as e:
+                return {"success": False, "error": f"Payload rendering failed: {e}"}
+            try:
+                resp = await self.http_client.post(url, json=json_payload, timeout=node.timeout_seconds)
+                if resp.status_code in (200, 201, 202, 204):
+                    if resp.content:
+                        try:
+                            data = resp.json()
+                        except json.JSONDecodeError:
+                            data = resp.text
+                    else:
+                        data = {}
+                    return {"success": True, "data": data}
+                return {"success": False, "error": f"Webhook failed: {resp.status_code}"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     def _sanitize_llm_prompt(self, prompt: str) -> str:
         forbidden = ["system:", "user:", "assistant:", "ignore previous", "you are now", "jailbreak"]
         for f in forbidden:
-            prompt = prompt.replace(f, "")
+            prompt = re.sub(re.escape(f), '', prompt, flags=re.IGNORECASE)
         if len(prompt) > 8000:
             prompt = prompt[:8000]
         return prompt
 
     async def _execute_llm_text_generate(self, node: WorkflowNode, context: Dict) -> Dict:
-        prompt = template_engine.render(node.config.get("prompt", ""), context)
-        prompt = self._sanitize_llm_prompt(prompt)
-        model = node.config.get("model") or os.environ.get("OLLAMA_MODEL", "mistral")
-        try:
-            from hyperion_task.agents.base import get_shared_client
-            client = get_shared_client()
-            response = await client.generate(model=model, prompt=prompt)
-            if hasattr(response, 'response'):
-                text = response.response
-            elif isinstance(response, dict):
-                text = response.get('response', '')
-            else:
-                text = str(response)
-            return {"success": True, "data": text}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        sem = self._get_integration_semaphore("llm")
+        async with sem:
+            prompt = template_engine.render(node.config.get("prompt", ""), context)
+            prompt = self._sanitize_llm_prompt(prompt)
+            model = node.config.get("model") or os.environ.get("OLLAMA_MODEL", "mistral")
+            try:
+                from hyperion_task.agents.base import get_shared_client
+                client = get_shared_client()
+                if client is None:
+                    return {"success": False, "error": "LLM client not available"}
+                response = await client.generate(model=model, prompt=prompt)
+                if hasattr(response, 'response'):
+                    text = response.response
+                elif isinstance(response, dict):
+                    text = response.get('response', '')
+                else:
+                    text = str(response)
+                return {"success": True, "data": text}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
 
     async def _execute_llm_summarize(self, node: WorkflowNode, context: Dict) -> Dict:
         text = template_engine.render(node.config.get("text", ""), context)
@@ -1049,3 +1321,15 @@ class WorkflowExecutor:
     async def _execute_throw_error(self, node: WorkflowNode, context: Dict) -> Dict:
         error_msg = template_engine.render(node.config.get("error_message", "Manual error"), context)
         return {"success": False, "error": error_msg}
+
+
+__all__ = [
+    "WorkflowStatus",
+    "TriggerType",
+    "ActionType",
+    "WorkflowNode",
+    "Workflow",
+    "WorkflowExecutor",
+    "WorkflowResult",
+    "WorkflowAPIResponse",
+]
