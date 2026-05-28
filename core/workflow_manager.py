@@ -50,14 +50,11 @@ class WorkflowManager:
                 if node_data.get("on_error") and node_data["on_error"] in node_map:
                     workflow.nodes[current_id].on_error = node_map[node_data["on_error"]]
         start_temp_id = definition.get("start_node")
-        if start_temp_id:
-            if start_temp_id in node_map:
-                workflow.start_node = node_map[start_temp_id]
-            else:
-                raise ValueError(f"Start node with temp_id '{start_temp_id}' not found in workflow definition.")
-        else:
-            workflow.start_node = list(workflow.nodes.keys())[0]
-            logger.warning(f"No start_node specified for workflow '{workflow.name}', defaulting to first node.")
+        if not start_temp_id:
+            raise ValueError("Workflow definition must include 'start_node'")
+        if start_temp_id not in node_map:
+            raise ValueError(f"Start node with temp_id '{start_temp_id}' not found in workflow definition.")
+        workflow.start_node = node_map[start_temp_id]
         self.active_workflows[workflow.workflow_id] = workflow
         return workflow
 
@@ -66,6 +63,10 @@ class WorkflowManager:
             user_input = f"Email from {data.get('from')} with subject: {data.get('subject')}"
             intent = await self.nlu.parse_intent(user_input)
             if intent["intent"] == "check_status":
+                order_id = intent["params"].get("order_id")
+                if not order_id or not isinstance(order_id, str) or len(order_id) > 50 or not order_id.strip():
+                    logger.warning(f"Invalid or missing order_id from email: {order_id}")
+                    return
                 workflow_def = {
                     "name": f"Auto-Reply to {data.get('from')}",
                     "description": "Automated status check workflow",
@@ -75,8 +76,8 @@ class WorkflowManager:
                             "temp_id": "query_node",
                             "action_type": "database_query",
                             "config": {
-                                "query": "SELECT status FROM orders WHERE order_id=?",
-                                "params": {"order_id": intent["params"].get("order_id")}
+                                "query": "SELECT status FROM orders WHERE order_id = :order_id",
+                                "params": {"order_id": order_id}
                             },
                             "next_node": "send_email_node"
                         },
