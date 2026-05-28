@@ -398,7 +398,14 @@ class WorkflowExecutor:
             else:
                 return {"success": False, "error": f"Unsupported method {method}"}
             if 200 <= resp.status_code <= 299:
-                return {"success": True, "data": resp.json() if resp.text else {}}
+                try:
+                    if resp.content:
+                        data = resp.json()
+                    else:
+                        data = {}
+                except json.JSONDecodeError:
+                    data = resp.text
+                return {"success": True, "data": data}
             return {"success": False, "error": f"HTTP {resp.status_code}"}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -512,16 +519,16 @@ class WorkflowExecutor:
         results = []
         max_loop_iterations = node.config.get("max_iterations", 100)
         sub_workflow.max_iterations = node.config.get("sub_workflow_max_iterations", 10)
-        depth = context.get("_depth", 0) + 1
-        if depth > self._loop_depth_limit:
+        current_depth = context.get("_depth", 0)
+        new_depth = current_depth + 1
+        if new_depth > self._loop_depth_limit:
             return {"success": False, "error": f"Loop depth exceeded limit {self._loop_depth_limit}"}
-        clean_context = {k: v for k, v in context.items() if k != "_depth"}
         for idx, item in enumerate(items):
             if idx >= max_loop_iterations:
                 break
-            sub_context = {**clean_context, "loop_item": item, "loop_index": idx}
+            sub_context = {**context, "loop_item": item, "loop_index": idx}
             try:
-                result = await self.execute_workflow(sub_workflow, sub_context, depth=depth)
+                result = await self.execute_workflow(sub_workflow, sub_context, depth=new_depth)
                 results.append(result)
             except Exception as e:
                 logger.error(f"Loop iteration {idx} failed: {e}")
