@@ -8,6 +8,10 @@ class ERPConnector(ABC):
         pass
 
     @abstractmethod
+    async def get_inventory(self, item_id: str) -> Dict:
+        pass
+
+    @abstractmethod
     async def update_crm_lead(self, lead_id: str, status: str) -> Dict:
         pass
 
@@ -28,6 +32,9 @@ class DummyERPConnector(ERPConnector):
     async def get_order_status(self, order_id: str) -> Dict:
         return {"order_id": order_id, "status": "processing", "estimated_delivery": "2026-06-01"}
 
+    async def get_inventory(self, item_id: str) -> Dict:
+        return {"item_id": item_id, "quantity": 100, "source": "dummy"}
+
     async def update_crm_lead(self, lead_id: str, status: str) -> Dict:
         return {"success": True}
 
@@ -38,4 +45,5 @@ class DummyERPConnector(ERPConnector):
         return {"success": True}
 
     async def manage_inventory(self, item_id: str, quantity_change: int) -> Dict:
-        return {"new_quantity": "unknown"}
+        new_qty = 100 + quantity_change
+        return {"new_quantity": new_qty}
