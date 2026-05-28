@@ -5,8 +5,9 @@ import uvicorn
 from hyperion_task.database.sqlite import TaskDatabase
 from hyperion_task.integrations.notion_erp import NotionERPConnector
 from hyperion_task.integrations.erp import DummyERPConnector
-from hyperion_task.web.dashboard import app, set_workflow_manager
+from hyperion_task.web.dashboard import app, set_workflow_manager, set_agent_orchestrator
 from hyperion_task.core.workflow_manager import WorkflowManager
+from hyperion_task.agents import AgentOrchestrator
 from hyperion_task.utils.logging import setup_logging
 
 setup_logging(level=os.environ.get("LOG_LEVEL", "INFO"), json_format=True)
@@ -77,6 +78,9 @@ async def main():
     workflow_manager = WorkflowManager(db, integrations)
     set_workflow_manager(workflow_manager)
 
+    agent_orchestrator = AgentOrchestrator(integrations, workflow_executor=workflow_manager.executor)
+    set_agent_orchestrator(agent_orchestrator)
+
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
@@ -92,6 +96,7 @@ async def main():
         )
     finally:
         await workflow_manager.close()
+        await agent_orchestrator.shutdown()
         await db.close()
         if email_integration and hasattr(email_integration, 'close'):
             await email_integration.close()
