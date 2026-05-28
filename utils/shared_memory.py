@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 from datetime import datetime
 from .redis_client import get_redis_client
 
+_redis_lock = asyncio.Lock()
+
 class SharedMemory:
     def __init__(self):
         self._in_memory: Dict[str, Any] = {}
@@ -12,9 +14,13 @@ class SharedMemory:
         self._redis = None
 
     async def _get_redis(self):
-        if self._redis is None:
+        if self._redis is not None:
+            return self._redis
+        async with _redis_lock:
+            if self._redis is not None:
+                return self._redis
             self._redis = await get_redis_client()
-        return self._redis
+            return self._redis
 
     async def set(self, key: str, value: Any, ttl_seconds: Optional[float] = None):
         redis = await self._get_redis()
