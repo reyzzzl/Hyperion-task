@@ -4,6 +4,8 @@ import logging
 import os
 import base64
 import gzip
+import copy
+from pathlib import Path
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -122,13 +124,23 @@ class Workflow:
     max_iterations: int = 100
 
 
+def _is_path_inside(base: Path, target: Path) -> bool:
+    try:
+        return target.is_relative_to(base)
+    except AttributeError:
+        base_str = str(base)
+        target_str = str(target)
+        return target_str == base_str or target_str.startswith(base_str + os.sep)
+
+
 class WorkflowExecutor:
     def __init__(self, db, integrations: Dict[str, Any], max_concurrent: int = 10):
         self.db = db
         self.integrations = integrations
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.active_executions: Dict[str, asyncio.Task] = {}
-        self.metrics = {"executed": 0, "succeeded": 0, "failed": 0}
+        self._metrics_lock = asyncio.Lock()
+        self._metrics = {"executed": 0, "succeeded": 0, "failed": 0}
         self.http_client = httpx.AsyncClient()
         depth_limit = os.environ.get("WORKFLOW_DEPTH_LIMIT", "5")
         self._loop_depth_limit = int(depth_limit) if depth_limit.isdigit() else 5
@@ -141,6 +153,7 @@ class WorkflowExecutor:
             "condition": self._execute_condition,
             "loop": self._execute_loop,
             "delay": self._execute_delay,
+            "wait": self._execute_delay,
 
             "google_sheets_read": self._execute_google_sheets_read,
             "google_sheets_write": self._execute_google_sheets_write,
@@ -192,13 +205,20 @@ class WorkflowExecutor:
             "decompress_gzip": self._execute_decompress_gzip,
             "encrypt_aes": self._execute_encrypt_aes,
             "decrypt_aes": self._execute_decrypt_aes,
-            "wait": self._execute_wait,
             "stop": self._execute_stop,
             "throw_error": self._execute_throw_error,
         }
 
     async def close(self):
         await self.http_client.aclose()
+
+    async def _inc_metric(self, name: str, delta: int = 1):
+        async with self._metrics_lock:
+            self._metrics[name] = self._metrics.get(name, 0) + delta
+
+    async def get_metrics(self) -> Dict[str, int]:
+        async with self._metrics_lock:
+            return self._metrics.copy()
 
     async def _load_workflow_from_db(self, workflow_id: str) -> Optional[Workflow]:
         data = await self.db.get_workflow(workflow_id)
@@ -248,6 +268,7 @@ class WorkflowExecutor:
                 "workflow_id": workflow.workflow_id
             }
         execution_id = str(uuid.uuid4())
+        self.active_executions[execution_id] = asyncio.current_task()
         context = {
             "execution_id": execution_id,
             "workflow_id": workflow.workflow_id,
@@ -258,7 +279,7 @@ class WorkflowExecutor:
             "started_at": datetime.now().isoformat(),
             "_depth": depth,
         }
-        self.metrics["executed"] += 1
+        await self._inc_metric("executed")
         try:
             async with self.semaphore:
                 current_node_id = workflow.start_node
@@ -273,7 +294,7 @@ class WorkflowExecutor:
                     if not node:
                         context["errors"].append(f"Node {current_node_id} not found")
                         break
-                    logger.debug(f"Executing node {node.node_id} ({node.action_type.value})")
+                    logger.debug(f"[{execution_id}] Executing node {node.node_id} ({node.action_type.value})")
                     node_result = None
                     action_func = self.registered_actions.get(node.action_type.value)
                     if not action_func:
@@ -282,6 +303,7 @@ class WorkflowExecutor:
                         continue
 
                     success = False
+                    no_retry_actions = {"throw_error", "stop"}
                     for attempt in range(node.retry_count + 1):
                         try:
                             node_result = await asyncio.wait_for(
@@ -299,6 +321,7 @@ class WorkflowExecutor:
                                     else:
                                         current_node_id = node.config.get("false_node", node.next_node)
                                 elif node.action_type.value == "stop":
+                                    success = True
                                     current_node_id = None
                                     break
                                 else:
@@ -306,17 +329,33 @@ class WorkflowExecutor:
                                 success = True
                                 break
                             else:
+                                if node.action_type.value in no_retry_actions:
+                                    break
                                 if attempt < node.retry_count:
-                                    logger.warning(f"Retrying node {node.node_id} ({attempt+1}/{node.retry_count}) after failure: {node_result.get('error')}")
+                                    logger.warning(f"[{execution_id}] Retrying node {node.node_id} ({attempt+1}/{node.retry_count}) after failure: {node_result.get('error')}")
                                     await asyncio.sleep(2)
                         except asyncio.TimeoutError:
-                            context["errors"].append(f"Node {current_node_id} timed out after {node.timeout_seconds}s")
-                            current_node_id = node.on_error
-                            break
+                            logger.error(f"[{execution_id}] Node {current_node_id} timed out after {node.timeout_seconds}s (attempt {attempt+1})")
+                            if node.action_type.value in no_retry_actions:
+                                break
+                            if attempt < node.retry_count:
+                                await asyncio.sleep(2)
+                                continue
+                            else:
+                                context["errors"].append(f"Node {current_node_id} timed out after {node.timeout_seconds}s")
+                                current_node_id = node.on_error
+                                break
                         except Exception as e:
-                            context["errors"].append(f"Node {current_node_id} unexpected error: {str(e)}")
-                            current_node_id = node.on_error
-                            break
+                            logger.error(f"[{execution_id}] Node {current_node_id} unexpected error: {str(e)} (attempt {attempt+1})")
+                            if node.action_type.value in no_retry_actions:
+                                break
+                            if attempt < node.retry_count:
+                                await asyncio.sleep(2)
+                                continue
+                            else:
+                                context["errors"].append(f"Node {current_node_id} unexpected error: {str(e)}")
+                                current_node_id = node.on_error
+                                break
                     if not success:
                         if not context["errors"]:
                             context["errors"].append(node_result.get("error", "Unknown error") if node_result else "Node execution failed")
@@ -325,23 +364,32 @@ class WorkflowExecutor:
                     context["errors"].append("Max iterations reached, possible infinite loop")
             context["completed_at"] = datetime.now().isoformat()
             if not context["errors"]:
-                self.metrics["succeeded"] += 1
+                await self._inc_metric("succeeded")
                 context["status"] = "completed"
             else:
-                self.metrics["failed"] += 1
+                await self._inc_metric("failed")
                 context["status"] = "failed"
         except Exception as e:
-            logger.error(f"Workflow execution error: {e}")
-            self.metrics["failed"] += 1
+            logger.error(f"[{execution_id}] Workflow execution error: {e}")
+            await self._inc_metric("failed")
             context["status"] = "failed"
             context["errors"].append(str(e))
+        finally:
+            self.active_executions.pop(execution_id, None)
         return context
 
     async def execute_workflow_by_id(self, workflow_id: str, input_data: Dict) -> Dict:
         workflow = await self._load_workflow_from_db(workflow_id)
         if not workflow:
             return {"success": False, "error": f"Workflow {workflow_id} not found"}
-        return await self.execute_workflow(workflow, input_data)
+        result = await self.execute_workflow(workflow, input_data)
+        return {
+            "success": result.get("status") == "completed",
+            "status": result.get("status"),
+            "errors": result.get("errors", []),
+            "workflow_id": result.get("workflow_id"),
+            "data": result
+        }
 
     def _store_node_output(self, context: Dict, node: WorkflowNode, data: Any):
         context["node_outputs"][node.node_id] = data
@@ -351,11 +399,9 @@ class WorkflowExecutor:
     def _evaluate_expression(self, expr: str, context: Dict) -> Any:
         try:
             return template_engine.render(expr, context)
-        except Exception:
-            try:
-                return template_engine._evaluate_expression(expr, context)
-            except Exception:
-                return None
+        except Exception as e:
+            logger.error(f"Expression evaluation failed: {expr}, error: {e}")
+            return None
 
     async def _execute_http_request(self, node: WorkflowNode, context: Dict) -> Dict:
         config = node.config
@@ -384,12 +430,12 @@ class WorkflowExecutor:
             if method == "GET":
                 resp = await self.http_client.get(url, headers=headers, timeout=node.timeout_seconds)
             elif method == "POST":
-                if isinstance(body, dict):
+                if isinstance(body, (dict, list)):
                     resp = await self.http_client.post(url, headers=headers, json=body, timeout=node.timeout_seconds)
                 else:
                     resp = await self.http_client.post(url, headers=headers, content=body, timeout=node.timeout_seconds)
             elif method == "PUT":
-                if isinstance(body, dict):
+                if isinstance(body, (dict, list)):
                     resp = await self.http_client.put(url, headers=headers, json=body, timeout=node.timeout_seconds)
                 else:
                     resp = await self.http_client.put(url, headers=headers, content=body, timeout=node.timeout_seconds)
@@ -398,13 +444,13 @@ class WorkflowExecutor:
             else:
                 return {"success": False, "error": f"Unsupported method {method}"}
             if 200 <= resp.status_code <= 299:
-                try:
-                    if resp.content:
+                if resp.content:
+                    try:
                         data = resp.json()
-                    else:
-                        data = {}
-                except json.JSONDecodeError:
-                    data = resp.text
+                    except json.JSONDecodeError:
+                        data = resp.text
+                else:
+                    data = {}
                 return {"success": True, "data": data}
             return {"success": False, "error": f"HTTP {resp.status_code}"}
         except Exception as e:
@@ -412,15 +458,21 @@ class WorkflowExecutor:
 
     async def _execute_database_query(self, node: WorkflowNode, context: Dict) -> Dict:
         config = node.config
-        query = template_engine.render(config.get("query", ""), context)
+        query = config.get("query", "")
+        if not query:
+            return {"success": False, "error": "Missing 'query' in database node"}
+        query = template_engine.render(query, context)
         params_raw = config.get("params", {})
         params = {k: template_engine.render(str(v), context) for k, v in params_raw.items()}
         try:
             if not hasattr(self.db, 'db') or self.db.db is None:
                 return {"success": False, "error": "Database connection not available"}
             cursor = await self.db.db.execute(query, params)
-            rows = await cursor.fetchall()
-            return {"success": True, "data": [dict(row) for row in rows]}
+            try:
+                rows = await cursor.fetchall()
+                return {"success": True, "data": [dict(row) for row in rows]}
+            finally:
+                await cursor.close()
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -432,9 +484,11 @@ class WorkflowExecutor:
         email_service = self.integrations.get("email")
         if email_service:
             result = await email_service.send_email(to, subject, body)
-            if isinstance(result, dict) and result.get("success"):
-                return {"success": True, "data": result}
-            return {"success": False, "error": result.get("error", "Unknown email error")}
+            if isinstance(result, dict):
+                if result.get("success"):
+                    return {"success": True, "data": result}
+                return {"success": False, "error": result.get("error", "Unknown email error")}
+            return {"success": False, "error": f"Unexpected response type: {type(result)}"}
         return {"success": False, "error": "No email integration configured"}
 
     async def _execute_transform_data(self, node: WorkflowNode, context: Dict) -> Dict:
@@ -465,22 +519,19 @@ class WorkflowExecutor:
         false_node = config.get("false_node")
         if not field_expr:
             return {"success": False, "error": "Condition missing 'field'"}
-        try:
-            current_value = self._evaluate_expression(field_expr, context)
-        except Exception as e:
-            return {"success": False, "error": f"Failed to evaluate field expression: {e}"}
+        current_value = self._evaluate_expression(field_expr, context)
         condition_met = False
         try:
             if operator == "equals":
-                condition_met = str(current_value) == str(value)
+                condition_met = current_value == value
             elif operator == "not_equals":
-                condition_met = str(current_value) != str(value)
+                condition_met = current_value != value
             elif operator == "greater_than":
                 condition_met = float(current_value) > float(value)
             elif operator == "less_than":
                 condition_met = float(current_value) < float(value)
             elif operator == "contains":
-                condition_met = str(value) in str(current_value)
+                condition_met = value in current_value if hasattr(current_value, "__contains__") else str(value) in str(current_value)
             elif operator == "not_empty":
                 condition_met = bool(current_value)
             elif operator == "empty":
@@ -488,7 +539,8 @@ class WorkflowExecutor:
             else:
                 return {"success": False, "error": f"Unknown operator: {operator}"}
         except (ValueError, TypeError) as e:
-            return {"success": False, "error": f"Type error in condition: {e}"}
+            logger.error(f"Condition evaluation error: {e}")
+            condition_met = False
         next_node = true_node if condition_met else false_node
         return {"success": True, "data": {"condition_met": condition_met, "next_node": next_node}}
 
@@ -516,6 +568,7 @@ class WorkflowExecutor:
         sub_workflow = await self._load_workflow_from_db(sub_workflow_id)
         if not sub_workflow:
             return {"success": False, "error": f"Sub-workflow {sub_workflow_id} not found or invalid"}
+        sub_workflow = copy.deepcopy(sub_workflow)
         results = []
         max_loop_iterations = node.config.get("max_iterations", 100)
         sub_workflow.max_iterations = node.config.get("sub_workflow_max_iterations", 10)
@@ -547,9 +600,9 @@ class WorkflowExecutor:
         spreadsheet_id = template_engine.render(node.config.get("spreadsheet_id", ""), context)
         range_name = template_engine.render(node.config.get("range", "Sheet1!A1:Z"), context)
         result = await gs.sheets_operation(spreadsheet_id, range_name, operation="read")
-        if "values" in result:
+        if isinstance(result, dict) and "values" in result:
             return {"success": True, "data": result["values"]}
-        return {"success": False, "error": result.get("error", "Read failed")}
+        return {"success": False, "error": result.get("error", "Read failed") if isinstance(result, dict) else "Invalid response"}
 
     async def _execute_google_sheets_write(self, node: WorkflowNode, context: Dict) -> Dict:
         gs = self.integrations.get("google")
@@ -567,9 +620,9 @@ class WorkflowExecutor:
                 new_row.append(cell)
             rendered_values.append(new_row)
         result = await gs.sheets_operation(spreadsheet_id, range_name, values=rendered_values, operation="write")
-        if result.get("success"):
+        if isinstance(result, dict) and result.get("success"):
             return {"success": True, "data": result}
-        return {"success": False, "error": result.get("error", "Write failed")}
+        return {"success": False, "error": result.get("error", "Write failed") if isinstance(result, dict) else "Invalid response"}
 
     async def _execute_google_drive_upload(self, node: WorkflowNode, context: Dict) -> Dict:
         gs = self.integrations.get("google")
@@ -660,7 +713,10 @@ class WorkflowExecutor:
         try:
             resp = await self.http_client.post(url, json={"chat_id": chat_id, "text": text})
             if resp.status_code == 200:
-                return {"success": True, "data": resp.json()}
+                data = resp.json()
+                if data.get("ok"):
+                    return {"success": True, "data": data}
+                return {"success": False, "error": data.get("description", "Telegram error")}
             return {"success": False, "error": f"Telegram error: {resp.text}"}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -758,16 +814,14 @@ class WorkflowExecutor:
     async def _execute_local_file_read(self, node: WorkflowNode, context: Dict) -> Dict:
         file_path = template_engine.render(node.config.get("file_path", ""), context)
         try:
-            normalized = os.path.normpath(file_path)
-            if normalized.startswith('..') or os.path.isabs(normalized):
-                return {"success": False, "error": "Path traversal not allowed"}
-            allowed_dir = os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")
-            allowed_dir_real = os.path.realpath(allowed_dir)
-            full_path = os.path.realpath(os.path.join(allowed_dir, normalized))
-            if not full_path.startswith(allowed_dir_real):
+            allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
+            requested = (allowed_dir / file_path).resolve()
+            if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
+            if requested == allowed_dir:
+                return {"success": False, "error": "Cannot read root data directory as file"}
             import aiofiles
-            async with aiofiles.open(full_path, mode='r') as f:
+            async with aiofiles.open(requested, mode='r') as f:
                 content = await f.read()
             return {"success": True, "data": content}
         except Exception as e:
@@ -777,22 +831,19 @@ class WorkflowExecutor:
         file_path = template_engine.render(node.config.get("file_path", ""), context)
         content = template_engine.render(node.config.get("content", ""), context)
         try:
-            normalized = os.path.normpath(file_path)
-            if normalized.startswith('..') or os.path.isabs(normalized):
-                return {"success": False, "error": "Path traversal not allowed"}
-            allowed_dir = os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")
-            allowed_dir_real = os.path.realpath(allowed_dir)
-            full_path = os.path.realpath(os.path.join(allowed_dir, normalized))
-            if not full_path.startswith(allowed_dir_real):
+            allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
+            requested = (allowed_dir / file_path).resolve()
+            if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
-            parent_dir = os.path.dirname(full_path)
-            if parent_dir and not parent_dir.startswith(allowed_dir_real):
+            if requested == allowed_dir:
+                return {"success": False, "error": "Cannot write to root data directory"}
+            if not _is_path_inside(allowed_dir, requested.parent):
                 return {"success": False, "error": "Parent directory outside allowed scope"}
-            os.makedirs(parent_dir, exist_ok=True)
+            requested.parent.mkdir(parents=True, exist_ok=True)
             import aiofiles
-            async with aiofiles.open(full_path, mode='w') as f:
+            async with aiofiles.open(requested, mode='w') as f:
                 await f.write(content)
-            return {"success": True, "data": {"path": full_path}}
+            return {"success": True, "data": {"path": str(requested)}}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -801,16 +852,19 @@ class WorkflowExecutor:
             from reportlab.pdfgen import canvas
             file_path = template_engine.render(node.config.get("file_path", "output.pdf"), context)
             text = template_engine.render(node.config.get("text", ""), context)
-            allowed_dir = os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")
-            allowed_dir_real = os.path.realpath(allowed_dir)
-            full_path = os.path.realpath(os.path.join(allowed_dir, os.path.basename(file_path)))
-            if not full_path.startswith(allowed_dir_real):
+            allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
+            requested = (allowed_dir / os.path.basename(file_path)).resolve()
+            if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            c = canvas.Canvas(full_path)
+            if requested == allowed_dir:
+                return {"success": False, "error": "Cannot write to root data directory"}
+            if not _is_path_inside(allowed_dir, requested.parent):
+                return {"success": False, "error": "Parent directory outside allowed scope"}
+            requested.parent.mkdir(parents=True, exist_ok=True)
+            c = canvas.Canvas(str(requested))
             c.drawString(100, 750, text)
             c.save()
-            return {"success": True, "data": {"path": full_path}}
+            return {"success": True, "data": {"path": str(requested)}}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -819,18 +873,21 @@ class WorkflowExecutor:
             import openpyxl
             file_path = template_engine.render(node.config.get("file_path", "output.xlsx"), context)
             data = node.config.get("data", [])
-            allowed_dir = os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")
-            allowed_dir_real = os.path.realpath(allowed_dir)
-            full_path = os.path.realpath(os.path.join(allowed_dir, os.path.basename(file_path)))
-            if not full_path.startswith(allowed_dir_real):
+            allowed_dir = Path(os.environ.get("WORKFLOW_DATA_DIR", "./workflow_data")).resolve()
+            requested = (allowed_dir / os.path.basename(file_path)).resolve()
+            if not _is_path_inside(allowed_dir, requested):
                 return {"success": False, "error": "Path outside allowed directory"}
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            if requested == allowed_dir:
+                return {"success": False, "error": "Cannot write to root data directory"}
+            if not _is_path_inside(allowed_dir, requested.parent):
+                return {"success": False, "error": "Parent directory outside allowed scope"}
+            requested.parent.mkdir(parents=True, exist_ok=True)
             wb = openpyxl.Workbook()
             ws = wb.active
             for row in data:
                 ws.append(row)
-            wb.save(full_path)
-            return {"success": True, "data": {"path": full_path}}
+            wb.save(str(requested))
+            return {"success": True, "data": {"path": str(requested)}}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -846,9 +903,9 @@ class WorkflowExecutor:
                 content_length = response.headers.get("content-length")
                 if content_length and int(content_length) > max_size:
                     return {"success": False, "error": f"Response too large: {content_length} bytes (max {max_size})"}
-                body = b""
+                body = bytearray()
                 async for chunk in response.aiter_bytes():
-                    body += chunk
+                    body.extend(chunk)
                     if len(body) > max_size:
                         return {"success": False, "error": f"Response exceeded max size {max_size}"}
                 html = body.decode("utf-8", errors="replace")
@@ -893,13 +950,29 @@ class WorkflowExecutor:
         try:
             resp = await self.http_client.post(url, json=rendered, timeout=node.timeout_seconds)
             if resp.status_code in (200, 201, 202, 204):
-                return {"success": True, "data": resp.json() if resp.text else {}}
+                if resp.content:
+                    try:
+                        data = resp.json()
+                    except json.JSONDecodeError:
+                        data = resp.text
+                else:
+                    data = {}
+                return {"success": True, "data": data}
             return {"success": False, "error": f"Webhook failed: {resp.status_code}"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _sanitize_llm_prompt(self, prompt: str) -> str:
+        forbidden = ["system:", "user:", "assistant:", "ignore previous", "you are now", "jailbreak"]
+        for f in forbidden:
+            prompt = prompt.replace(f, "")
+        if len(prompt) > 8000:
+            prompt = prompt[:8000]
+        return prompt
+
     async def _execute_llm_text_generate(self, node: WorkflowNode, context: Dict) -> Dict:
         prompt = template_engine.render(node.config.get("prompt", ""), context)
+        prompt = self._sanitize_llm_prompt(prompt)
         model = node.config.get("model") or os.environ.get("OLLAMA_MODEL", "mistral")
         try:
             from hyperion_task.agents.base import get_shared_client
@@ -919,6 +992,7 @@ class WorkflowExecutor:
         text = template_engine.render(node.config.get("text", ""), context)
         model = node.config.get("model") or os.environ.get("OLLAMA_MODEL", "mistral")
         prompt = f"Summarize the following text concisely:\n\n{text}"
+        prompt = self._sanitize_llm_prompt(prompt)
         temp_node = WorkflowNode(action_type=ActionType.LLM_TEXT_GENERATE, config={"prompt": prompt, "model": model})
         return await self._execute_llm_text_generate(temp_node, context)
 
@@ -927,6 +1001,7 @@ class WorkflowExecutor:
         categories = node.config.get("categories", ["positive", "negative", "neutral"])
         model = node.config.get("model") or os.environ.get("OLLAMA_MODEL", "mistral")
         prompt = f"Classify the following text into one of {categories}. Return only the category name.\n\nText: {text}"
+        prompt = self._sanitize_llm_prompt(prompt)
         temp_node = WorkflowNode(action_type=ActionType.LLM_TEXT_GENERATE, config={"prompt": prompt, "model": model})
         return await self._execute_llm_text_generate(temp_node, context)
 
@@ -967,11 +1042,6 @@ class WorkflowExecutor:
 
     async def _execute_decrypt_aes(self, node: WorkflowNode, context: Dict) -> Dict:
         return {"success": False, "error": "AES decrypt not implemented"}
-
-    async def _execute_wait(self, node: WorkflowNode, context: Dict) -> Dict:
-        seconds = node.config.get("seconds", 1)
-        await asyncio.sleep(seconds)
-        return {"success": True, "data": f"Waited {seconds}s"}
 
     async def _execute_stop(self, node: WorkflowNode, context: Dict) -> Dict:
         return {"success": True, "data": {"stopped": True, "message": node.config.get("message", "Workflow stopped")}}
