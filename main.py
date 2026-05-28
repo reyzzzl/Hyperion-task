@@ -7,13 +7,10 @@ from hyperion_task.integrations.notion_erp import NotionERPConnector
 from hyperion_task.integrations.erp import DummyERPConnector
 from hyperion_task.web.dashboard import app, set_workflow_manager
 from hyperion_task.core.workflow_manager import WorkflowManager
+from hyperion_task.utils.logging import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+setup_logging(level=os.environ.get("LOG_LEVEL", "INFO"), json_format=True)
 logger = logging.getLogger("Main")
-
 
 def get_erp_connector():
     notion_token = os.environ.get("NOTION_API_TOKEN")
@@ -26,7 +23,6 @@ def get_erp_connector():
         "inventory": os.environ.get("NOTION_DB_INVENTORY", ""),
     }
     return NotionERPConnector(notion_token, databases)
-
 
 async def main():
     llm_backend = os.environ.get("LLM_BACKEND", "ollama").lower()
@@ -97,7 +93,11 @@ async def main():
     finally:
         await workflow_manager.close()
         await db.close()
-
+        if email_integration and hasattr(email_integration, 'close'):
+            await email_integration.close()
+        if isinstance(erp, NotionERPConnector) and hasattr(erp, 'close'):
+            await erp.close()
+        logger.info("Shutdown complete")
 
 if __name__ == "__main__":
     try:
