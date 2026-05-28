@@ -2,6 +2,7 @@ import asyncio
 import time
 from enum import Enum
 from typing import Callable, Any, Optional
+from .exceptions import CircuitOpenError
 
 class CircuitState(Enum):
     CLOSED = "closed"
@@ -27,7 +28,7 @@ class CircuitBreaker:
                     self.state = CircuitState.HALF_OPEN
                     self.half_open_calls = 0
                 else:
-                    raise Exception(f"Circuit breaker '{self.name}' is OPEN")
+                    raise CircuitOpenError(f"Circuit breaker '{self.name}' is OPEN")
         try:
             result = await func(*args, **kwargs)
             await self._record_success()
