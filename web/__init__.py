@@ -1,1 +1,0 @@
-from .dashboard import app, set_workflow_manager
