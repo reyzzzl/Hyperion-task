@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from .workflow_engine import Workflow, WorkflowNode, WorkflowExecutor, TriggerType, ActionType
 from .nlu_engine import NLUEngine
@@ -18,6 +18,7 @@ class WorkflowManager:
         self.active_workflows: Dict[str, Workflow] = {}
         self.integrations = integrations
         self._running = True
+        self._running_tasks: Set[asyncio.Task] = set()
 
     def create_workflow_from_json(self, definition: Dict) -> Workflow:
         workflow = Workflow(
@@ -120,7 +121,9 @@ class WorkflowManager:
         while self._running:
             try:
                 workflow = await asyncio.wait_for(self.workflow_queue.get(), timeout=1.0)
-                asyncio.create_task(self._execute_workflow(workflow))
+                task = asyncio.create_task(self._execute_workflow(workflow))
+                self._running_tasks.add(task)
+                task.add_done_callback(self._running_tasks.discard)
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
@@ -138,4 +141,9 @@ class WorkflowManager:
 
     async def close(self):
         self._running = False
+        for task in self._running_tasks:
+            if not task.done():
+                task.cancel()
+        if self._running_tasks:
+            await asyncio.wait(self._running_tasks, timeout=5.0)
         await self.executor.close()
