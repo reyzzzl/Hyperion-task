@@ -72,6 +72,22 @@ class NotionERPConnector(ERPConnector):
             return {"order_id": order_id, "status": status, "source": "notion"}
         return {"order_id": order_id, "status": "not_found", "source": "notion"}
 
+    async def get_inventory(self, item_id: str) -> Dict:
+        if "inventory" not in self.databases:
+            return {"error": "Inventory database not configured"}
+        query = {
+            "filter": {
+                "property": "Item ID",
+                "rich_text": {"equals": item_id}
+            }
+        }
+        result = await self._notion_request("POST", f"/databases/{self.databases['inventory']}/query", json_data=query)
+        if "results" in result and len(result["results"]) > 0:
+            page = result["results"][0]
+            quantity = page.get("properties", {}).get("Quantity", {}).get("number", 0)
+            return {"item_id": item_id, "quantity": quantity, "source": "notion"}
+        return {"item_id": item_id, "quantity": 0, "source": "notion", "error": "Item not found"}
+
     async def update_crm_lead(self, lead_id: str, status: str) -> Dict:
         if "orders" not in self.databases:
             return {"error": "Orders database not configured"}
