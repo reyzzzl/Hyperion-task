@@ -83,7 +83,10 @@ async def task_stream(
             if current_snapshot != previous_snapshot:
                 previous_snapshot = current_snapshot
                 yield f"data: {current_snapshot}\n\n"
-            await asyncio.sleep(2)
+            try:
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                break
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/", response_class=HTMLResponse)
@@ -123,6 +126,14 @@ async def get_task(
         raise HTTPException(404, "Task not found")
     return task
 
+async def _run_approved_workflow(workflow_id: str, executor):
+    try:
+        result = await executor.execute_workflow_by_id(workflow_id, {})
+        if result.get("status") == "failed":
+            logger.error(f"Approved workflow {workflow_id} failed: {result.get('errors', [])}")
+    except Exception as e:
+        logger.error(f"Approved workflow {workflow_id} raised exception: {e}", exc_info=True)
+
 @app.post("/api/tasks/{task_id}/approve")
 async def approve_task(
     task_id: str,
@@ -144,13 +155,8 @@ async def approve_task(
     await manager.db.upsert_task(task)
     workflow_id = task.get("metadata", {}).get("workflow_id")
     if workflow_id:
-        workflow_data = await manager.db.get_workflow(workflow_id)
-        if workflow_data:
-            workflow = manager.create_workflow_from_json(workflow_data)
-            await manager.workflow_queue.put(workflow)
-            logger.info(f"Task {task_id} approved, workflow {workflow_id} re-queued")
-        else:
-            logger.warning(f"Task {task_id} approved but workflow {workflow_id} not found")
+        asyncio.create_task(_run_approved_workflow(workflow_id, manager.executor))
+        logger.info(f"Task {task_id} approved, workflow {workflow_id} re-queued")
     else:
         logger.warning(f"Task {task_id} approved but no workflow_id in metadata, cannot re-queue")
     return {"message": "Task approved and re-queued"}
