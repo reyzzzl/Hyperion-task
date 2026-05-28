@@ -32,6 +32,7 @@ class AgentOrchestrator:
         self._running = True
         self._init_agents()
         self.routing_history: List[Dict] = []
+        self._max_history = 1000
 
     def _init_agents(self):
         for name, agent_class in AgentRegistry.list().items():
@@ -78,6 +79,8 @@ class AgentOrchestrator:
                 "timestamp": datetime.now().isoformat(),
                 "correlation_id": correlation_id
             })
+            if len(self.routing_history) > self._max_history:
+                self.routing_history = self.routing_history[-self._max_history:]
 
     async def _classify_intent(self, text: str) -> Optional[BaseAgent]:
         if not text:
