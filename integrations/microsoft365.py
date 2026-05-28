@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -23,6 +24,7 @@ class Microsoft365:
         self.token = None
         self.token_expiry = datetime.now()
         self.graph_url = "https://graph.microsoft.com/v1.0"
+        self._client = httpx.AsyncClient()
         self._acquire_token()
 
     def _acquire_token(self):
@@ -54,38 +56,40 @@ class Microsoft365:
             }
         }
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(endpoint, headers=headers, json=email_msg)
-            if resp.status_code == 401:
-                self._acquire_token()
-                if self.token:
-                    headers["Authorization"] = f"Bearer {self.token}"
-                    resp = await client.post(endpoint, headers=headers, json=email_msg)
-            return {"success": resp.status_code == 202, "status_code": resp.status_code}
+        resp = await self._client.post(endpoint, headers=headers, json=email_msg)
+        if resp.status_code == 401:
+            self._acquire_token()
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+                resp = await self._client.post(endpoint, headers=headers, json=email_msg)
+        return {"success": resp.status_code == 202, "status_code": resp.status_code}
 
     async def create_teams_meeting(self, subject: str, start_time: str, end_time: str, attendees: List[str]) -> Dict:
         self._ensure_token()
         if not self.token:
             return {"success": False, "error": "No valid token"}
         endpoint = f"{self.graph_url}/users/admin@{self.tenant_id}/calendar/events"
+        timezone = os.environ.get("TIMEZONE", "UTC")
         event = {
             "subject": subject,
-            "start": {"dateTime": start_time, "timeZone": "Asia/Jakarta"},
-            "end": {"dateTime": end_time, "timeZone": "Asia/Jakarta"},
+            "start": {"dateTime": start_time, "timeZone": timezone},
+            "end": {"dateTime": end_time, "timeZone": timezone},
             "attendees": [{"emailAddress": {"address": e}} for e in attendees],
             "isOnlineMeeting": True,
             "onlineMeetingProvider": "teamsForBusiness"
         }
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(endpoint, headers=headers, json=event)
-            if resp.status_code == 401:
-                self._acquire_token()
-                if self.token:
-                    headers["Authorization"] = f"Bearer {self.token}"
-                    resp = await client.post(endpoint, headers=headers, json=event)
-            if resp.status_code == 201:
-                data = resp.json()
-                join_url = data.get('onlineMeeting', {}).get('joinUrl', '')
-                return {"success": True, "event_id": data['id'], "teams_link": join_url}
-            return {"success": False, "error": resp.text}
+        resp = await self._client.post(endpoint, headers=headers, json=event)
+        if resp.status_code == 401:
+            self._acquire_token()
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+                resp = await self._client.post(endpoint, headers=headers, json=event)
+        if resp.status_code == 201:
+            data = resp.json()
+            join_url = data.get('onlineMeeting', {}).get('joinUrl', '')
+            return {"success": True, "event_id": data['id'], "teams_link": join_url}
+        return {"success": False, "error": resp.text}
+
+    async def close(self):
+        await self._client.aclose()
