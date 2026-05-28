@@ -17,6 +17,7 @@ class WorkflowManager:
         self.workflow_queue = asyncio.Queue()
         self.active_workflows: Dict[str, Workflow] = {}
         self.integrations = integrations
+        self._running = True
 
     def create_workflow_from_json(self, definition: Dict) -> Workflow:
         workflow = Workflow(
@@ -101,7 +102,7 @@ class WorkflowManager:
         if not email_service:
             logger.info("Email polling disabled: no email integration")
             return
-        while True:
+        while self._running:
             try:
                 emails = await email_service.read_emails(query="is:unread", max_results=5)
                 for email in emails:
@@ -116,10 +117,14 @@ class WorkflowManager:
     async def start(self):
         logger.info("Workflow Manager started")
         asyncio.create_task(self._email_polling_loop())
-        while True:
-            workflow = await self.workflow_queue.get()
-            asyncio.create_task(self._execute_workflow(workflow))
-            await asyncio.sleep(0.1)
+        while self._running:
+            try:
+                workflow = await asyncio.wait_for(self.workflow_queue.get(), timeout=1.0)
+                asyncio.create_task(self._execute_workflow(workflow))
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Workflow queue error: {e}")
 
     async def _execute_workflow(self, workflow: Workflow):
         try:
@@ -132,4 +137,5 @@ class WorkflowManager:
             self.active_workflows.pop(workflow.workflow_id, None)
 
     async def close(self):
+        self._running = False
         await self.executor.close()
