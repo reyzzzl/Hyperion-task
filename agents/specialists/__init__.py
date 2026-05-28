@@ -20,5 +20,3 @@ def register_all_agents():
     AgentRegistry.register("it", ITAgent)
     AgentRegistry.register("legal", LegalAgent)
     AgentRegistry.register("executive", ExecutiveAgent)
-
-register_all_agents()
